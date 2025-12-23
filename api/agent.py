@@ -69,6 +69,55 @@ def get_vic_agent() -> Agent:
     return _vic_agent
 
 
+def post_validate_response(response_text: str, source_content: str) -> str:
+    """
+    Additional validation layer - catches hallucinations even if LLM
+    doesn't return proper structured output.
+    """
+    import re
+
+    response_lower = response_text.lower()
+    source_lower = source_content.lower() if source_content else ""
+
+    # Check for architect/designer mentions not in source
+    architect_patterns = [
+        r'architect(?:ed|s)?\s+(?:was|were|by)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)',
+        r'(?:designed|built|constructed|created)\s+by\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)',
+        r'(?:the\s+)?architect\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)',
+    ]
+
+    for pattern in architect_patterns:
+        matches = re.findall(pattern, response_text, re.IGNORECASE)
+        for name in matches:
+            if name.lower() not in source_lower:
+                # Hallucinated architect name - return safe response
+                return (
+                    "That's a great question about who designed or built it. "
+                    "I want to be accurate, so I should say my articles don't "
+                    "specifically mention the architect or builder for this one."
+                )
+
+    # Check for specific years not in source
+    response_years = set(re.findall(r'\b(1[0-9]{3}|20[0-9]{2})\b', response_text))
+    source_years = set(re.findall(r'\b(1[0-9]{3}|20[0-9]{2})\b', source_content)) if source_content else set()
+
+    # Allow years that are in source, flag others
+    hallucinated_years = response_years - source_years
+    if hallucinated_years and source_content:
+        # Only flag if we have source content to compare against
+        # and the hallucinated year is being stated as a fact
+        for year in hallucinated_years:
+            # Check if year is stated as a definitive fact
+            year_context = re.search(rf'(\w+\s+){year}(\s+\w+)?', response_text)
+            if year_context:
+                return (
+                    "I want to make sure I give you accurate dates. "
+                    "Let me stick to what my articles specifically mention..."
+                )
+
+    return response_text  # Passed validation
+
+
 async def generate_response(user_message: str, session_id: str | None = None) -> str:
     """
     Generate a validated response to the user's message.
@@ -89,7 +138,12 @@ async def generate_response(user_message: str, session_id: str | None = None) ->
 
         # Run the agent with validation
         result = await agent.run(user_message)
-        return result.data.response_text
+        response_text = result.data.response_text
+        source_content = result.data.source_content if hasattr(result.data, 'source_content') else ""
+
+        # Additional post-validation layer
+        validated_response = post_validate_response(response_text, source_content)
+        return validated_response
 
     except ValidationError as e:
         # Validation failed - the agent tried to hallucinate
