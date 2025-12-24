@@ -1,5 +1,7 @@
 """Pydantic AI agent for VIC - the voice of Vic Keegan."""
 
+import os
+import httpx
 from pydantic_ai import Agent
 from pydantic import ValidationError
 
@@ -8,6 +10,124 @@ from .tools import search_articles, get_user_memory
 
 # Lazy-loaded agent instance
 _vic_agent: Agent | None = None
+
+# OPTIMIZATION: Persistent HTTP client for Anthropic API (connection reuse)
+_anthropic_client: httpx.AsyncClient | None = None
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+
+# Supermemory for user profiles
+SUPERMEMORY_API_KEY = os.environ.get("SUPERMEMORY_API_KEY", "")
+_supermemory_client: httpx.AsyncClient | None = None
+
+
+def get_supermemory_client() -> httpx.AsyncClient:
+    """Get or create persistent Supermemory HTTP client."""
+    global _supermemory_client
+    if _supermemory_client is None and SUPERMEMORY_API_KEY:
+        _supermemory_client = httpx.AsyncClient(
+            base_url="https://api.supermemory.ai",
+            headers={
+                "Authorization": f"Bearer {SUPERMEMORY_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            timeout=5.0,  # Fast timeout - memory enrichment shouldn't slow responses
+        )
+    return _supermemory_client
+
+
+async def get_user_memory_context(user_id: str | None) -> str:
+    """Fetch user's memory profile from Supermemory for personalization."""
+    if not user_id or not SUPERMEMORY_API_KEY:
+        return ""
+
+    try:
+        client = get_supermemory_client()
+        if not client:
+            return ""
+
+        # Search for user's past interactions
+        response = await client.post(
+            "/v4/search",
+            json={
+                "q": "interests topics articles viewed searches",
+                "containerTags": [user_id],
+                "limit": 5,
+            },
+        )
+
+        if response.status_code != 200:
+            return ""
+
+        data = response.json()
+        memories = data.get("results", [])
+
+        if not memories:
+            return ""
+
+        # Format memories into context
+        memory_items = []
+        for m in memories[:5]:
+            content = m.get("content", "")
+            if content:
+                memory_items.append(f"- {content}")
+
+        if memory_items:
+            import sys
+            print(f"[VIC Supermemory] Found {len(memory_items)} memories for user", file=sys.stderr)
+            return "\n\n## What I remember about this user:\n" + "\n".join(memory_items)
+
+        return ""
+    except Exception as e:
+        import sys
+        print(f"[VIC Supermemory] Error fetching memories: {e}", file=sys.stderr)
+        return ""
+
+
+async def store_conversation_topics(user_id: str | None, topics: list[str]) -> None:
+    """Store conversation topics in Supermemory for future reference."""
+    if not user_id or not topics or not SUPERMEMORY_API_KEY:
+        return
+
+    try:
+        client = get_supermemory_client()
+        if not client:
+            return
+
+        content = f"User discussed: {', '.join(topics)}"
+
+        await client.post(
+            "/v3/documents",
+            json={
+                "content": content,
+                "containerTag": user_id,
+                "metadata": {
+                    "type": "conversation_topic",
+                    "topics": topics,
+                    "source": "vic_clm",
+                },
+            },
+        )
+        import sys
+        print(f"[VIC Supermemory] Stored topics: {topics}", file=sys.stderr)
+    except Exception as e:
+        import sys
+        print(f"[VIC Supermemory] Error storing topics: {e}", file=sys.stderr)
+
+
+def get_anthropic_client() -> httpx.AsyncClient:
+    """Get or create persistent Anthropic HTTP client."""
+    global _anthropic_client
+    if _anthropic_client is None:
+        _anthropic_client = httpx.AsyncClient(
+            base_url="https://api.anthropic.com",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            timeout=15.0,
+        )
+    return _anthropic_client
 
 # System prompt that defines Vic's persona and strict grounding rules
 VIC_SYSTEM_PROMPT = """You are VIC, the voice of Vic Keegan - a warm London historian.
@@ -192,7 +312,7 @@ async def detect_and_store_correction(user_message: str, user_name: str | None, 
 async def generate_response(user_message: str, session_id: str | None = None, user_name: str | None = None) -> str:
     """
     Generate a validated response to the user's message.
-    Simplified for speed - no Zep memory, just search and respond.
+    OPTIMIZED for speed - parallel operations, skip slow enrichment.
 
     Args:
         user_message: The user's question
@@ -200,44 +320,55 @@ async def generate_response(user_message: str, session_id: str | None = None, us
         user_name: Optional authenticated user's first name
     """
     from .tools import normalize_query, get_voyage_embedding
-    from .database import search_articles_hybrid
+    from .database import search_articles_hybrid, get_cached_response, cache_response
     import re
+    import asyncio
+    import sys
 
     validation_notes = []
     validation_passed = True
     confidence_score = 1.0
 
     try:
-        # Step 0: Check if user is making a correction (store for review)
-        correction_detected = await detect_and_store_correction(user_message, user_name, session_id)
-        if correction_detected:
-            return f"Thank you{' ' + user_name if user_name else ''}, I've noted that correction. It will be reviewed and added to my knowledge base."
+        # OPTIMIZATION: Check for corrections ONLY if message looks like one (fast pattern check)
+        correction_patterns = ["wrong", "incorrect", "actually", "correct answer"]
+        if any(p in user_message.lower() for p in correction_patterns):
+            correction_detected = await detect_and_store_correction(user_message, user_name, session_id)
+            if correction_detected:
+                return f"Thank you{' ' + user_name if user_name else ''}, I've noted that correction. It will be reviewed and added to my knowledge base."
 
-        # Step 0b: Check cache first for instant responses
-        from .database import get_cached_response, cache_response
-        cached = await get_cached_response(user_message)
+        # OPTIMIZATION: Run cache check, embedding, AND user memory fetch in parallel
+        normalized_query = normalize_query(user_message)
+
+        # Extract user_id from session_id (format: "Name|userId_timestamp" or just "userId")
+        user_id = None
+        if session_id:
+            if '|' in session_id:
+                user_id = session_id.split('|')[1].split('_')[0]  # Get userId part
+            else:
+                user_id = session_id.split('_')[0]
+
+        cache_task = get_cached_response(user_message)
+        embedding_task = get_voyage_embedding(normalized_query)
+        memory_task = get_user_memory_context(user_id)
+
+        # Wait for all - if cache hits, we still have embedding ready for next time
+        cached, embedding, user_memory = await asyncio.gather(cache_task, embedding_task, memory_task)
+
         if cached:
-            import sys
             print(f"[VIC Cache] HIT for '{user_message}'", file=sys.stderr)
             return cached["response"]
 
-        # Step 1: Search articles AND graph in parallel
-        import asyncio
-        normalized_query = normalize_query(user_message)
-
-        # Run embedding, then searches in parallel
-        embedding = await get_voyage_embedding(normalized_query)
-
-        from .tools import search_zep_graph
-        article_task = search_articles_hybrid(
+        # Article search with the embedding we already have
+        results = await search_articles_hybrid(
             query_embedding=embedding,
             query_text=normalized_query,
             limit=2,
             similarity_threshold=0.3,
         )
-        graph_task = search_zep_graph(normalized_query)
 
-        results, graph_data = await asyncio.gather(article_task, graph_task)
+        # Graph data disabled for speed
+        graph_data = {"connections": [], "facts": []}
 
         article_titles = [r['title'] for r in results] if results else []
         graph_connections = graph_data.get("connections", [])
@@ -312,6 +443,7 @@ IMPORTANT: If you mention any of these connections, preface it with "From my wid
 
         prompt_with_sources = f"""Question: "{user_message}"
 {name_instruction}
+{user_memory}
 
 Source material:
 {actual_source_content}
@@ -320,30 +452,20 @@ Source material:
 Respond naturally using facts from above. Keep it conversational and concise."""
 
         # Step 3: Generate response with direct Anthropic call (faster)
-        import os
-        import httpx
-
-        anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
-
-        async with httpx.AsyncClient() as client:
-            llm_response = await client.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={
-                    "x-api-key": anthropic_key,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json",
-                },
-                json={
-                    "model": "claude-3-5-haiku-20241022",
-                    "max_tokens": 200,  # Short, punchy responses
-                    "system": VIC_SYSTEM_PROMPT,
-                    "messages": [{"role": "user", "content": prompt_with_sources}],
-                },
-                timeout=15.0,
-            )
-            llm_response.raise_for_status()
-            data = llm_response.json()
-            response_text = data["content"][0]["text"]
+        # OPTIMIZATION: Use persistent HTTP client for connection reuse
+        client = get_anthropic_client()
+        llm_response = await client.post(
+            "/v1/messages",
+            json={
+                "model": "claude-3-5-haiku-20241022",
+                "max_tokens": 200,  # Short, punchy responses
+                "system": VIC_SYSTEM_PROMPT,
+                "messages": [{"role": "user", "content": prompt_with_sources}],
+            },
+        )
+        llm_response.raise_for_status()
+        data = llm_response.json()
+        response_text = data["content"][0]["text"]
 
         # Clean up any metadata that leaked into the response
         response_text = re.sub(r'\n*facts_stated:.*$', '', response_text, flags=re.DOTALL | re.IGNORECASE)
@@ -369,8 +491,11 @@ Respond naturally using facts from above. Keep it conversational and concise."""
         try:
             await cache_response(user_message, validated_response, article_titles)
         except Exception as cache_err:
-            import sys
             print(f"[VIC Cache] Write error: {cache_err}", file=sys.stderr)
+
+        # Store topics in Supermemory for future personalization (fire and forget)
+        if user_id and article_titles:
+            asyncio.create_task(store_conversation_topics(user_id, article_titles))
 
         return validated_response
 

@@ -12,6 +12,24 @@ VOYAGE_MODEL = "voyage-2"
 ZEP_API_KEY = os.environ.get("ZEP_API_KEY", "")
 LOST_LONDON_GRAPH_ID = "lost-london"
 
+# OPTIMIZATION: Persistent HTTP clients for connection reuse
+_voyage_client: httpx.AsyncClient | None = None
+
+
+def get_voyage_client() -> httpx.AsyncClient:
+    """Get or create persistent Voyage HTTP client."""
+    global _voyage_client
+    if _voyage_client is None:
+        _voyage_client = httpx.AsyncClient(
+            base_url="https://api.voyageai.com",
+            headers={
+                "Authorization": f"Bearer {VOYAGE_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            timeout=10.0,
+        )
+    return _voyage_client
+
 
 # Phonetic corrections for voice input - matching lost.london
 PHONETIC_CORRECTIONS: dict[str, str] = {
@@ -67,24 +85,19 @@ def normalize_query(query: str) -> str:
 
 
 async def get_voyage_embedding(text: str) -> list[float]:
-    """Generate embedding using Voyage AI."""
-    async with httpx.AsyncClient() as client:
-        response = await client.post(
-            "https://api.voyageai.com/v1/embeddings",
-            headers={
-                "Authorization": f"Bearer {VOYAGE_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": VOYAGE_MODEL,
-                "input": text,
-                "input_type": "query",
-            },
-            timeout=30.0,
-        )
-        response.raise_for_status()
-        data = response.json()
-        return data["data"][0]["embedding"]
+    """Generate embedding using Voyage AI with persistent client."""
+    client = get_voyage_client()
+    response = await client.post(
+        "/v1/embeddings",
+        json={
+            "model": VOYAGE_MODEL,
+            "input": text,
+            "input_type": "query",
+        },
+    )
+    response.raise_for_status()
+    data = response.json()
+    return data["data"][0]["embedding"]
 
 
 async def search_zep_graph(query: str) -> dict:
