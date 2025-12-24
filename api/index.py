@@ -126,6 +126,35 @@ def extract_user_message(messages: list[dict]) -> str | None:
     return None
 
 
+def extract_user_name_from_messages(messages: list[dict]) -> str | None:
+    """
+    Extract user name from system message if present.
+    Looks for patterns like "USER'S NAME: Dan" in the system prompt.
+    """
+    import sys
+
+    for msg in messages:
+        if msg.get("role") == "system":
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                # Look for "USER'S NAME: X" pattern
+                match = re.search(r"USER'S NAME:\s*(\w+)", content, re.IGNORECASE)
+                if match:
+                    name = match.group(1)
+                    print(f"[VIC CLM] Found user name in system message: {name}", file=sys.stderr)
+                    return name
+
+                # Also try "Hello X" or "Welcome X" patterns
+                match = re.search(r"(?:Hello|Welcome back),?\s+(\w+)", content)
+                if match:
+                    name = match.group(1)
+                    print(f"[VIC CLM] Found user name in greeting pattern: {name}", file=sys.stderr)
+                    return name
+
+    print(f"[VIC CLM] No user name found in messages", file=sys.stderr)
+    return None
+
+
 def extract_session_id(request: Request, body: dict | None = None) -> str | None:
     """
     Extract custom_session_id from request.
@@ -329,12 +358,25 @@ async def chat_completions(
     session_id = extract_session_id(request, body)
     user_name = extract_user_name_from_session(session_id)
 
+    # If no user name from session, try extracting from system message
+    if not user_name:
+        user_name = extract_user_name_from_messages(messages)
+
     # Debug logging
     import sys
     print(f"[VIC CLM] ===== REQUEST DEBUG =====", file=sys.stderr)
     print(f"[VIC CLM] Session ID: {session_id}", file=sys.stderr)
     print(f"[VIC CLM] User Name: {user_name}", file=sys.stderr)
     print(f"[VIC CLM] Body keys: {list(body.keys())}", file=sys.stderr)
+    print(f"[VIC CLM] Number of messages: {len(messages)}", file=sys.stderr)
+    for i, msg in enumerate(messages):
+        role = msg.get("role", "unknown")
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            preview = content[:200] + "..." if len(content) > 200 else content
+        else:
+            preview = str(content)[:200]
+        print(f"[VIC CLM] Message {i}: role={role}, content={preview}", file=sys.stderr)
     print(f"[VIC CLM] ===========================", file=sys.stderr)
 
     # Extract the user's message
