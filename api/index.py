@@ -394,11 +394,10 @@ async def chat_completions(
     if session_id:
         asyncio.create_task(save_user_message(session_id, user_message, "user"))
 
-    # Generate and stream response
-    response_text = await generate_response(user_message, session_id, user_name)
-
+    # OPTIMIZATION: Stream filler phrases while generating response
+    # This disguises the delay and makes VIC feel more responsive
     return StreamingResponse(
-        stream_response(response_text, session_id),
+        stream_with_padding(user_message, session_id, user_name),
         media_type="text/event-stream",
     )
 
