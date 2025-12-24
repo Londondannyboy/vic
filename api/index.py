@@ -126,9 +126,43 @@ def extract_user_message(messages: list[dict]) -> str | None:
     return None
 
 
-def extract_session_id(request: Request) -> str | None:
-    """Extract custom_session_id from query params."""
-    return request.query_params.get("custom_session_id")
+def extract_session_id(request: Request, body: dict | None = None) -> str | None:
+    """
+    Extract custom_session_id from request.
+    Hume may send it in query params, headers, or body.
+    """
+    import sys
+
+    # Try query params first
+    session_id = request.query_params.get("custom_session_id")
+    if session_id:
+        print(f"[VIC CLM] Session ID from query params: {session_id}", file=sys.stderr)
+        return session_id
+
+    # Try headers (X-Hume-Session-Id or similar)
+    for header_name in ["x-hume-session-id", "x-session-id", "x-custom-session-id"]:
+        session_id = request.headers.get(header_name)
+        if session_id:
+            print(f"[VIC CLM] Session ID from header {header_name}: {session_id}", file=sys.stderr)
+            return session_id
+
+    # Try body (Hume might include it in the request)
+    if body:
+        # Check various possible locations in body
+        session_id = body.get("custom_session_id") or body.get("session_id")
+        if session_id:
+            print(f"[VIC CLM] Session ID from body: {session_id}", file=sys.stderr)
+            return session_id
+
+        # Check in metadata if present
+        metadata = body.get("metadata", {})
+        session_id = metadata.get("custom_session_id") or metadata.get("session_id")
+        if session_id:
+            print(f"[VIC CLM] Session ID from body.metadata: {session_id}", file=sys.stderr)
+            return session_id
+
+    print(f"[VIC CLM] No session ID found. Query: {dict(request.query_params)}, Headers: {dict(request.headers)}", file=sys.stderr)
+    return None
 
 
 def extract_user_name_from_session(session_id: str | None) -> str | None:
@@ -292,8 +326,16 @@ async def chat_completions(
         raise HTTPException(status_code=400, detail="Invalid JSON body")
 
     messages = body.get("messages", [])
-    session_id = extract_session_id(request)
+    session_id = extract_session_id(request, body)
     user_name = extract_user_name_from_session(session_id)
+
+    # Debug logging
+    import sys
+    print(f"[VIC CLM] ===== REQUEST DEBUG =====", file=sys.stderr)
+    print(f"[VIC CLM] Session ID: {session_id}", file=sys.stderr)
+    print(f"[VIC CLM] User Name: {user_name}", file=sys.stderr)
+    print(f"[VIC CLM] Body keys: {list(body.keys())}", file=sys.stderr)
+    print(f"[VIC CLM] ===========================", file=sys.stderr)
 
     # Extract the user's message
     user_message = extract_user_message(messages)
