@@ -397,7 +397,7 @@ async def generate_response(user_message: str, session_id: str | None = None, us
         user_name: Optional authenticated user's first name
     """
     from .tools import normalize_query, get_voyage_embedding
-    from .database import search_articles_hybrid, get_cached_response, cache_response
+    from .database import search_articles_hybrid
     import re
     import asyncio
     import sys
@@ -425,16 +425,12 @@ async def generate_response(user_message: str, session_id: str | None = None, us
             else:
                 user_id = session_id.split('_')[0]
 
-        cache_task = get_cached_response(user_message)
+        # REMOVED: Global cache was causing stale/unpersonalized responses
+        # Zep handles per-user memory, Groq is fast enough (~500ms)
         embedding_task = get_voyage_embedding(normalized_query)
         memory_task = get_user_memory_context(user_id)
 
-        # Wait for all - if cache hits, we still have embedding ready for next time
-        cached, embedding, user_memory = await asyncio.gather(cache_task, embedding_task, memory_task)
-
-        if cached:
-            print(f"[VIC Cache] HIT for '{user_message}'", file=sys.stderr)
-            return cached["response"]
+        embedding, user_memory = await asyncio.gather(embedding_task, memory_task)
 
         # Article search with the embedding we already have
         # HIGHER threshold (0.5) to filter out irrelevant articles like piano factory
@@ -570,12 +566,6 @@ Respond naturally using facts from above. Keep it conversational and concise."""
 
         # Extract facts for logging
         facts_checked = extract_facts_from_response(validated_response)
-
-        # Cache the response for future queries (fire and forget)
-        try:
-            await cache_response(user_message, validated_response, article_titles)
-        except Exception as cache_err:
-            print(f"[VIC Cache] Write error: {cache_err}", file=sys.stderr)
 
         # Store conversation in Zep for history and fact extraction (fire and forget)
         if session_id:
