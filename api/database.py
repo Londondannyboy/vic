@@ -48,65 +48,94 @@ async def search_articles_hybrid(
     similarity_threshold: float = 0.3
 ) -> list[dict]:
     """
-    Hybrid search combining vector similarity and keyword matching.
-    Matches the query pattern used in lost.london/app/api/hume-tool/route.ts
+    Hybrid search using Reciprocal Rank Fusion (RRF).
+
+    RRF combines vector and keyword search by rank position, not raw scores.
+    Formula: RRF_score = 1/(k + vector_rank) + 1/(k + keyword_rank)
+    where k=60 is the standard constant.
+
+    This approach (used by Cole Meddin's MongoDB-RAG-Agent) provides better
+    accuracy than weighted score combination.
 
     Args:
         query_embedding: Vector embedding of the query
         query_text: Original query text for keyword matching
         limit: Maximum number of results
-        similarity_threshold: Minimum similarity score
+        similarity_threshold: Minimum similarity score (for filtering)
 
     Returns:
-        List of matching articles with scores
+        List of matching articles with RRF scores
     """
     import json
+    import sys
 
     async with get_connection() as conn:
-        # Convert embedding to JSON string for PostgreSQL
         embedding_json = json.dumps(query_embedding)
 
-        # Get first word for partial matching
-        first_word = query_text.split()[0] if query_text.split() else ""
-
+        # RRF with k=60 (industry standard)
+        # Get ranked results from both vector and keyword searches
         results = await conn.fetch("""
             WITH
-            vector_results AS (
-                SELECT id, 1 - (embedding <=> $1::vector) as vector_score
+            -- Vector search: rank by embedding similarity
+            vector_ranked AS (
+                SELECT
+                    id,
+                    ROW_NUMBER() OVER (ORDER BY embedding <=> $1::vector) as vector_rank,
+                    1 - (embedding <=> $1::vector) as vector_score
                 FROM knowledge_chunks
-                ORDER BY embedding <=> $1::vector
+                WHERE 1 - (embedding <=> $1::vector) > 0.3  -- Basic threshold
                 LIMIT 50
             ),
-            keyword_results AS (
-                SELECT id,
-                    CASE
-                        WHEN LOWER(content) LIKE '%' || $2 || '%' THEN 0.30
-                        WHEN LOWER(title) LIKE '%' || $2 || '%' THEN 0.25
-                        WHEN LOWER(title) LIKE '%' || $3 || '%' THEN 0.10
-                        ELSE 0
-                    END as keyword_score,
-                    CASE
-                        WHEN title LIKE 'Vic Keegan%Lost London%' THEN 0.10
-                        WHEN source_type = 'article' THEN 0.05
-                        ELSE 0
-                    END as type_boost
-                FROM knowledge_chunks
+            -- Keyword search: rank by text match quality
+            keyword_ranked AS (
+                SELECT
+                    id,
+                    ROW_NUMBER() OVER (ORDER BY keyword_score DESC) as keyword_rank,
+                    keyword_score
+                FROM (
+                    SELECT id,
+                        CASE
+                            WHEN LOWER(content) LIKE '%' || $2 || '%' THEN 3
+                            WHEN LOWER(title) LIKE '%' || $2 || '%' THEN 2
+                            ELSE 0
+                        END as keyword_score
+                    FROM knowledge_chunks
+                    WHERE LOWER(content) LIKE '%' || $2 || '%'
+                       OR LOWER(title) LIKE '%' || $2 || '%'
+                ) keyword_matches
+                WHERE keyword_score > 0
+            ),
+            -- RRF: Combine ranks using reciprocal rank fusion
+            rrf_combined AS (
+                SELECT
+                    COALESCE(v.id, k.id) as id,
+                    -- RRF formula: 1/(60 + rank) for each search method
+                    COALESCE(1.0 / (60 + v.vector_rank), 0) +
+                    COALESCE(1.0 / (60 + k.keyword_rank), 0) as rrf_score,
+                    v.vector_score,
+                    v.vector_rank,
+                    k.keyword_rank
+                FROM vector_ranked v
+                FULL OUTER JOIN keyword_ranked k ON v.id = k.id
             )
             SELECT
                 kc.id::text,
                 kc.title,
                 kc.content,
                 kc.source_type,
-                (COALESCE(vr.vector_score, 0) * 0.6) +
-                (COALESCE(kr.keyword_score, 0) * 0.4) +
-                COALESCE(kr.type_boost, 0) as score
-            FROM knowledge_chunks kc
-            LEFT JOIN vector_results vr ON kc.id = vr.id
-            LEFT JOIN keyword_results kr ON kc.id = kr.id
-            WHERE vr.id IS NOT NULL OR kr.keyword_score > 0
-            ORDER BY score DESC
-            LIMIT $4
-        """, embedding_json, query_text.lower(), first_word.lower(), limit)
+                r.rrf_score as score,
+                r.vector_score,
+                r.vector_rank,
+                r.keyword_rank
+            FROM rrf_combined r
+            JOIN knowledge_chunks kc ON kc.id = r.id
+            ORDER BY r.rrf_score DESC
+            LIMIT $3
+        """, embedding_json, query_text.lower(), limit)
+
+        print(f"[VIC RRF] Query: '{query_text[:30]}...' → {len(results)} results", file=sys.stderr)
+        for r in results[:3]:
+            print(f"[VIC RRF]   {r['title'][:40]}... (RRF={r['score']:.4f}, vec_rank={r['vector_rank']}, kw_rank={r['keyword_rank']})", file=sys.stderr)
 
         return [dict(r) for r in results]
 
