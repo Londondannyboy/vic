@@ -85,7 +85,7 @@ async def get_user_memory_context(user_id: str | None) -> str:
 
 
 async def get_conversation_history(session_id: str | None) -> list[dict]:
-    """Fetch recent conversation history from Zep sessions."""
+    """Fetch recent conversation history from Zep threads."""
     if not session_id or not ZEP_API_KEY:
         return []
 
@@ -94,9 +94,9 @@ async def get_conversation_history(session_id: str | None) -> list[dict]:
         if not client:
             return []
 
-        # Get recent messages from Zep session
+        # Get recent messages from Zep thread (not session!)
         response = await client.get(
-            f"/api/v2/sessions/{session_id}/messages",
+            f"/api/v2/threads/{session_id}/messages",
             params={"limit": 10},
         )
 
@@ -104,7 +104,7 @@ async def get_conversation_history(session_id: str | None) -> list[dict]:
             return []
 
         data = response.json()
-        messages = data.get("messages", [])
+        messages = data.get("messages", []) if isinstance(data, dict) else data
 
         import sys
         print(f"[VIC Zep] Found {len(messages)} conversation messages", file=sys.stderr)
@@ -120,38 +120,50 @@ async def store_conversation_message(session_id: str | None, user_id: str | None
     if not session_id or not ZEP_API_KEY:
         return
 
+    import sys
+
     try:
         client = get_zep_client()
         if not client:
             return
 
-        # Ensure session exists
-        await client.post(
-            "/api/v2/sessions",
+        # Ensure user exists first
+        if user_id:
+            await client.post(
+                "/api/v2/users",
+                json={"user_id": user_id},
+            )
+
+        # Zep uses "threads" not "sessions" - create thread with user linkage
+        thread_response = await client.post(
+            "/api/v2/threads",
             json={
-                "session_id": session_id,
+                "thread_id": session_id,
                 "user_id": user_id,
+                "metadata": {"source": "vic-clm"},
             },
         )
+        print(f"[VIC Zep] Thread create response: {thread_response.status_code}", file=sys.stderr)
 
-        # Add message to session
-        await client.post(
-            f"/api/v2/sessions/{session_id}/messages",
+        # Add message to thread (correct endpoint!)
+        msg_response = await client.post(
+            f"/api/v2/threads/{session_id}/messages",
             json={
                 "messages": [
                     {
                         "role": role,
-                        "role_type": "user" if role == "user" else "assistant",
                         "content": content,
                     }
                 ]
             },
         )
+        print(f"[VIC Zep] Message add response: {msg_response.status_code}", file=sys.stderr)
 
-        import sys
-        print(f"[VIC Zep] Stored {role} message in session", file=sys.stderr)
+        if msg_response.status_code == 200:
+            print(f"[VIC Zep] ✓ Stored {role} message in thread", file=sys.stderr)
+        else:
+            print(f"[VIC Zep] ✗ Failed to store message: {msg_response.text[:100]}", file=sys.stderr)
     except Exception as e:
-        import sys
         print(f"[VIC Zep] Error storing message: {e}", file=sys.stderr)
 
 
