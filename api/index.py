@@ -378,10 +378,17 @@ async def chat_completions(
 
     messages = body.get("messages", [])
 
+    session_id = extract_session_id(request, body)
+    user_message_extracted = extract_user_message(messages)
+    topic_extracted = extract_topic(user_message_extracted) if user_message_extracted else None
+
     # Store for debugging
     _last_request_debug = {
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "session_id": session_id,
         "messages_count": len(messages),
+        "user_message_extracted": user_message_extracted,
+        "topic_extracted": topic_extracted,
         "messages": [
             {
                 "role": m.get("role"),
@@ -391,7 +398,6 @@ async def chat_completions(
         ],
         "body_keys": list(body.keys()),
     }
-    session_id = extract_session_id(request, body)
     user_name = extract_user_name_from_session(session_id)
 
     # If no user name from session, try extracting from system message
@@ -403,6 +409,8 @@ async def chat_completions(
     print(f"[VIC CLM] ===== REQUEST DEBUG =====", file=sys.stderr)
     print(f"[VIC CLM] Session ID: {session_id}", file=sys.stderr)
     print(f"[VIC CLM] User Name: {user_name}", file=sys.stderr)
+    print(f"[VIC CLM] User Message: {user_message_extracted}", file=sys.stderr)
+    print(f"[VIC CLM] Topic Extracted: {topic_extracted}", file=sys.stderr)
     print(f"[VIC CLM] Body keys: {list(body.keys())}", file=sys.stderr)
     print(f"[VIC CLM] Number of messages: {len(messages)}", file=sys.stderr)
     for i, msg in enumerate(messages):
@@ -415,8 +423,8 @@ async def chat_completions(
         print(f"[VIC CLM] Message {i}: role={role}, content={preview}", file=sys.stderr)
     print(f"[VIC CLM] ===========================", file=sys.stderr)
 
-    # Extract the user's message
-    user_message = extract_user_message(messages)
+    # Use the already extracted user message
+    user_message = user_message_extracted
 
     if not user_message:
         # No user message - return a prompt
