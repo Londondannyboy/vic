@@ -434,14 +434,21 @@ async def generate_response(user_message: str, session_id: str | None = None, us
 
         embedding, user_memory = await asyncio.gather(embedding_task, memory_task)
 
+        print(f"[VIC Search] Query: '{user_message}' -> Normalized: '{normalized_query}'", file=sys.stderr)
+        print(f"[VIC Search] Embedding length: {len(embedding) if embedding else 0}", file=sys.stderr)
+
         # Article search with the embedding we already have
-        # HIGHER threshold (0.5) to filter out irrelevant articles like piano factory
+        # LOWER threshold to ensure we find articles
         results = await search_articles_hybrid(
             query_embedding=embedding,
             query_text=normalized_query,
-            limit=3,
-            similarity_threshold=0.5,
+            limit=5,  # Get more results
+            similarity_threshold=0.3,  # Lower threshold
         )
+
+        print(f"[VIC Search] Found {len(results)} articles", file=sys.stderr)
+        for r in results[:3]:
+            print(f"[VIC Search]   - {r.get('title', 'NO TITLE')[:50]} (score: {r.get('score', 0):.4f})", file=sys.stderr)
 
         # NOTE: RRF scores are in 0.01-0.03 range, not 0.0-1.0
         # No additional filtering needed - RRF already ranks by relevance
