@@ -365,6 +365,8 @@ async def chat_completions(
     Receives conversation history, generates a validated response using
     Pydantic AI, and streams it back in OpenAI's format.
     """
+    global _last_request_debug
+
     # Verify authentication
     if not verify_token(credentials):
         raise HTTPException(status_code=401, detail="Invalid or missing auth token")
@@ -375,6 +377,20 @@ async def chat_completions(
         raise HTTPException(status_code=400, detail="Invalid JSON body")
 
     messages = body.get("messages", [])
+
+    # Store for debugging
+    _last_request_debug = {
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "messages_count": len(messages),
+        "messages": [
+            {
+                "role": m.get("role"),
+                "content": m.get("content", "")[:500] if isinstance(m.get("content"), str) else str(m.get("content", ""))[:500]
+            }
+            for m in messages
+        ],
+        "body_keys": list(body.keys()),
+    }
     session_id = extract_session_id(request, body)
     user_name = extract_user_name_from_session(session_id)
 
@@ -438,6 +454,16 @@ async def root():
 async def health():
     """Health check for monitoring."""
     return {"status": "healthy"}
+
+
+@app.get("/debug/last-request")
+async def debug_last_request():
+    """Return the last request received for debugging."""
+    return _last_request_debug
+
+
+# Store last request for debugging
+_last_request_debug: dict = {"status": "no requests yet"}
 
 
 @app.get("/debug/search")
