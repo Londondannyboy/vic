@@ -768,6 +768,104 @@ async def get_conversation_history(session_id: Optional[str]) -> list[dict]:
         return []
 
 
+async def store_unvalidated_interest(
+    user_id: str,
+    session_id: Optional[str],
+    topic: str,
+    article_title: Optional[str] = None,
+) -> None:
+    """
+    Store interest to Zep immediately but marked as UNVALIDATED.
+
+    This allows VIC to remember conversation context, but the interest
+    is flagged as unconfirmed. When user validates in dashboard,
+    a separate validated fact is added.
+    """
+    import sys
+
+    if not ZEP_API_KEY:
+        return
+
+    try:
+        client = get_zep_client()
+        if not client:
+            return
+
+        # Ensure user exists
+        await client.post(
+            "/api/v2/users",
+            json={"user_id": user_id},
+        )
+
+        # Store fact with validated=false metadata
+        fact_text = f"User discussed {article_title}" if article_title else f"User asked about {topic}"
+
+        await client.post(
+            f"/api/v2/users/{user_id}/facts",
+            json={
+                "facts": [fact_text],
+                "metadata": {
+                    "validated": False,  # Marked as unvalidated
+                    "pending_confirmation": True,
+                    "article_title": article_title,
+                    "source": "conversation",
+                    "session_id": session_id,
+                },
+            },
+        )
+        print(f"[VIC Zep] Stored unvalidated interest: {article_title or topic}", file=sys.stderr)
+
+    except Exception as e:
+        print(f"[VIC Zep] Error storing unvalidated interest: {e}", file=sys.stderr)
+
+
+async def get_pending_interest_count(user_id: str) -> int:
+    """Get count of pending interests awaiting user confirmation."""
+    import os
+
+    try:
+        frontend_url = os.environ.get("FRONTEND_URL", "https://lost.london")
+
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            # This endpoint needs auth, so we'll use a simple count endpoint
+            response = await client.get(
+                f"{frontend_url}/api/interests/count",
+                params={"userId": user_id},
+            )
+            if response.status_code == 200:
+                data = response.json()
+                return data.get("pending", 0)
+    except Exception:
+        pass
+    return 0
+
+
+def get_validation_encouragement(pending_count: int) -> str:
+    """Get an encouragement message for users with pending interests."""
+    import random
+
+    if pending_count == 0:
+        return ""
+
+    if pending_count == 1:
+        prompts = [
+            "\n\nBy the way, I noticed a topic you might be interested in. You can confirm it in your dashboard to help me remember what you like.",
+            "\n\nOh, and there's a topic waiting for you to confirm in your dashboard - it helps me personalize our conversations!",
+        ]
+    elif pending_count <= 3:
+        prompts = [
+            f"\n\nI've noted {pending_count} topics you've explored. Pop over to your dashboard when you get a chance to confirm which ones interest you most!",
+            f"\n\nThere are {pending_count} topics awaiting your confirmation in the dashboard. It really helps me tailor our chats to your interests.",
+        ]
+    else:
+        prompts = [
+            f"\n\nYou've got {pending_count} topics waiting for confirmation! Your dashboard is eager to hear which ones truly caught your fancy.",
+            f"\n\nWe've covered quite a bit! {pending_count} topics are pending your review in the dashboard - do let me know which ones interest you.",
+        ]
+
+    return random.choice(prompts)
+
+
 async def create_pending_interest(
     user_id: str,
     topic: str,
@@ -1834,15 +1932,25 @@ Respond naturally using facts from above. Keep it conversational and under 150 w
             )
         )
 
-        # Create PENDING interest for human confirmation (human-in-the-loop)
-        # User must confirm interest in dashboard before it's stored to Zep
+        # Store conversation + create pending interest for human validation
         if user_id and results:
             article_matched = len(results) > 0
             can_store, reason = await should_store_to_zep(user_message, article_matched, source_titles[0] if source_titles else None)
 
             if can_store and source_titles:
-                # Create pending interest - NOT stored to Zep until user confirms
                 top_result = results[0]
+
+                # 1. Store to Zep immediately (so VIC remembers) but mark as UNVALIDATED
+                # VIC can use this for conversation continuity
+                asyncio.create_task(store_unvalidated_interest(
+                    user_id=user_id,
+                    session_id=session_id,
+                    topic=user_message,
+                    article_title=top_result.get('title'),
+                ))
+
+                # 2. Create pending interest for dashboard confirmation
+                # When user confirms, it becomes validated
                 asyncio.create_task(create_pending_interest(
                     user_id=user_id,
                     topic=user_message,
@@ -1850,9 +1958,9 @@ Respond naturally using facts from above. Keep it conversational and under 150 w
                     article_title=top_result.get('title'),
                     article_slug=top_result.get('article_slug'),
                 ))
-                print(f"[VIC] Created pending interest for human confirmation: {source_titles[0][:30] if source_titles else 'none'}...", file=sys.stderr)
+                print(f"[VIC] Stored unvalidated + created pending interest: {source_titles[0][:30]}...", file=sys.stderr)
             else:
-                print(f"[VIC] Not creating pending interest: {reason}", file=sys.stderr)
+                print(f"[VIC] Not storing interest: {reason}", file=sys.stderr)
 
         return validated_response, enrichment_task
 
