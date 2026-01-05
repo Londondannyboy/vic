@@ -539,38 +539,69 @@ async def chat_completions(
         if session_id and '|' in session_id:
             user_id = session_id.split('|')[1].split('_')[0]
 
-        # Try to get user's topics from Zep if we don't have local context
+        # Try to get user's ACTUAL recent topics from user_queries table (ground truth)
+        # This is more reliable than Zep's inferred facts
         zep_topics = []
         if user_id and not last_topic:
             try:
-                from .agent import get_zep_client, ZEP_API_KEY
-                if ZEP_API_KEY:
-                    client = get_zep_client()
-                    if client:
-                        response = await client.post(
-                            "/api/v2/graph/search",
-                            json={
-                                "user_id": user_id,
-                                "query": "user interested in learning about topics",
-                                "limit": 5,
-                                "scope": "edges",
-                            },
-                        )
-                        if response.status_code == 200:
-                            edges = response.json().get("edges", [])
-                            for edge in edges:
-                                fact = edge.get("fact", "")
-                                # Extract topic from facts like "The user expressed interest in learning about X"
-                                if "interest" in fact.lower() and "learning about" in fact.lower():
-                                    import re
-                                    match = re.search(r"learning about ([^.]+)", fact, re.IGNORECASE)
-                                    if match:
-                                        topic = match.group(1).strip().rstrip('.')
-                                        if topic and len(topic) < 50:
-                                            zep_topics.append(topic)
-                            print(f"[VIC Greeting] Found Zep topics: {zep_topics}", file=sys.stderr)
+                from .database import get_connection
+                async with get_connection() as conn:
+                    # Get user's most recent queries with article titles
+                    recent = await conn.fetch("""
+                        SELECT DISTINCT article_title, created_at
+                        FROM user_queries
+                        WHERE user_id = $1 AND article_title IS NOT NULL
+                        ORDER BY created_at DESC
+                        LIMIT 5
+                    """, user_id)
+
+                    for row in recent:
+                        title = row['article_title']
+                        if title:
+                            # Clean up title - extract main topic
+                            # "Vic Keegan's Lost London 103: Thorney Island" -> "Thorney Island"
+                            if ':' in title:
+                                topic = title.split(':')[-1].strip()
+                            else:
+                                topic = title
+                            if topic and len(topic) < 50:
+                                zep_topics.append(topic)
+
+                    print(f"[VIC Greeting] Recent topics from DB: {zep_topics}", file=sys.stderr)
             except Exception as e:
-                print(f"[VIC Greeting] Error fetching Zep topics: {e}", file=sys.stderr)
+                print(f"[VIC Greeting] Error fetching DB topics: {e}", file=sys.stderr)
+
+                # Fallback to Zep if DB fails
+                try:
+                    from .agent import get_zep_client, ZEP_API_KEY
+                    if ZEP_API_KEY:
+                        client = get_zep_client()
+                        if client:
+                            response = await client.post(
+                                "/api/v2/graph/search",
+                                json={
+                                    "user_id": user_id,
+                                    "query": "user interested in learning about topics",
+                                    "limit": 5,
+                                    "scope": "edges",
+                                },
+                            )
+                            if response.status_code == 200:
+                                edges = response.json().get("edges", [])
+                                # Sort by created_at (most recent first)
+                                edges.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+                                for edge in edges:
+                                    fact = edge.get("fact", "")
+                                    if "interest" in fact.lower() and "learning about" in fact.lower():
+                                        import re
+                                        match = re.search(r"learning about ([^.]+)", fact, re.IGNORECASE)
+                                        if match:
+                                            topic = match.group(1).strip().rstrip('.')
+                                            if topic and len(topic) < 50:
+                                                zep_topics.append(topic)
+                                print(f"[VIC Greeting] Fallback Zep topics: {zep_topics}", file=sys.stderr)
+                except Exception as e2:
+                    print(f"[VIC Greeting] Zep fallback also failed: {e2}", file=sys.stderr)
 
         # Varied greeting templates for returning users with topics
         import random
