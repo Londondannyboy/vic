@@ -26,6 +26,12 @@ from .models import (
 from .tools import search_articles, get_user_memory
 from .agent_deps import VICAgentDeps
 from .agent_config import get_fast_agent, get_enriched_agent, VIC_SYSTEM_PROMPT, SAFE_TOPIC_CLUSTERS
+from .validation import (
+    validate_user_input,
+    should_store_to_zep,
+    fast_content_check,
+    ContentCategory,
+)
 
 # Lazy-loaded agent instance (legacy)
 _vic_agent: Optional[Agent] = None
@@ -1511,6 +1517,20 @@ async def generate_response_with_enrichment(
     from .database import search_articles_hybrid
     import sys
 
+    # ==========================================================================
+    # VALIDATION: Check content before processing
+    # ==========================================================================
+    validation_result = await validate_user_input(user_message, check_topic=False)
+
+    if not validation_result.is_valid:
+        print(f"[VIC Validation] Content blocked: {validation_result.category.value}", file=sys.stderr)
+        # Return VIC's warning response - don't process further
+        warning = validation_result.vic_warning or (
+            "I'm not sure that's something I can help with. "
+            "I specialise in London's hidden history. What aspect of the city would you like to explore?"
+        )
+        return (warning, None)
+
     # Check for prior enriched context
     prior_context = get_session_context(session_id)
 
@@ -1773,10 +1793,18 @@ Respond naturally using facts from above. Keep it conversational and under 150 w
             )
         )
 
-        # Store conversation in Zep (fire and forget)
-        if session_id:
-            asyncio.create_task(store_conversation_message(session_id, user_id, "user", user_message))
-            asyncio.create_task(store_conversation_message(session_id, user_id, "assistant", validated_response))
+        # Store conversation in Zep - ONLY if validated and article matched
+        if session_id and results:
+            # Check if we should store this interaction
+            article_matched = len(results) > 0
+            can_store, reason = await should_store_to_zep(user_message, article_matched, source_titles[0] if source_titles else None)
+
+            if can_store:
+                asyncio.create_task(store_conversation_message(session_id, user_id, "user", user_message))
+                asyncio.create_task(store_conversation_message(session_id, user_id, "assistant", validated_response))
+                print(f"[VIC Zep] Storing validated conversation (article: {source_titles[0][:30] if source_titles else 'none'}...)", file=sys.stderr)
+            else:
+                print(f"[VIC Zep] Not storing: {reason}", file=sys.stderr)
 
         return validated_response, enrichment_task
 
