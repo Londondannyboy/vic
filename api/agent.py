@@ -768,6 +768,47 @@ async def get_conversation_history(session_id: Optional[str]) -> list[dict]:
         return []
 
 
+async def create_pending_interest(
+    user_id: str,
+    topic: str,
+    article_id: Optional[int] = None,
+    article_title: Optional[str] = None,
+    article_slug: Optional[str] = None,
+) -> None:
+    """
+    Create a pending interest for human-in-the-loop validation.
+
+    The interest is stored as "pending" and displayed in the user's dashboard.
+    Only when the user confirms it does it get stored to Zep.
+    """
+    import sys
+    import os
+
+    try:
+        frontend_url = os.environ.get("FRONTEND_URL", "https://lost.london")
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(
+                f"{frontend_url}/api/interests",
+                json={
+                    "userId": user_id,
+                    "topic": topic,
+                    "articleId": article_id,
+                    "articleTitle": article_title,
+                    "articleSlug": article_slug,
+                    "source": "conversation",
+                },
+            )
+
+            if response.status_code == 200:
+                print(f"[VIC Pending] ✓ Created pending interest: {topic[:30]}... (article: {article_title})", file=sys.stderr)
+            else:
+                print(f"[VIC Pending] ✗ Failed to create pending interest: {response.status_code}", file=sys.stderr)
+
+    except Exception as e:
+        print(f"[VIC Pending] Error creating pending interest: {e}", file=sys.stderr)
+
+
 async def store_conversation_message(session_id: Optional[str], user_id: Optional[str], role: str, content: str) -> None:
     """Store conversation message in Zep for history and fact extraction."""
     if not session_id or not ZEP_API_KEY:
@@ -1793,18 +1834,25 @@ Respond naturally using facts from above. Keep it conversational and under 150 w
             )
         )
 
-        # Store conversation in Zep - ONLY if validated and article matched
-        if session_id and results:
-            # Check if we should store this interaction
+        # Create PENDING interest for human confirmation (human-in-the-loop)
+        # User must confirm interest in dashboard before it's stored to Zep
+        if user_id and results:
             article_matched = len(results) > 0
             can_store, reason = await should_store_to_zep(user_message, article_matched, source_titles[0] if source_titles else None)
 
-            if can_store:
-                asyncio.create_task(store_conversation_message(session_id, user_id, "user", user_message))
-                asyncio.create_task(store_conversation_message(session_id, user_id, "assistant", validated_response))
-                print(f"[VIC Zep] Storing validated conversation (article: {source_titles[0][:30] if source_titles else 'none'}...)", file=sys.stderr)
+            if can_store and source_titles:
+                # Create pending interest - NOT stored to Zep until user confirms
+                top_result = results[0]
+                asyncio.create_task(create_pending_interest(
+                    user_id=user_id,
+                    topic=user_message,
+                    article_id=top_result.get('article_id'),
+                    article_title=top_result.get('title'),
+                    article_slug=top_result.get('article_slug'),
+                ))
+                print(f"[VIC] Created pending interest for human confirmation: {source_titles[0][:30] if source_titles else 'none'}...", file=sys.stderr)
             else:
-                print(f"[VIC Zep] Not storing: {reason}", file=sys.stderr)
+                print(f"[VIC] Not creating pending interest: {reason}", file=sys.stderr)
 
         return validated_response, enrichment_task
 

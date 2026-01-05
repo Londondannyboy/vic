@@ -5,8 +5,8 @@
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
 
-# Pydantic AI for agent + validation
-pydantic-ai>=0.0.14
+# Pydantic AI for agent + validation + AG-UI
+pydantic-ai[ag-ui]>=0.0.14
 pydantic>=2.10.0
 
 # OpenAI types for CLM response format

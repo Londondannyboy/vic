@@ -131,6 +131,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Include validated interests router for human-in-the-loop Zep storage
+from .validated_interests import router as validated_interests_router
+app.include_router(validated_interests_router)
+
 
 def verify_token(credentials: Optional[HTTPAuthorizationCredentials]) -> bool:
     """Verify the Bearer token from Hume."""
