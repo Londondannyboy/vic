@@ -784,6 +784,174 @@ async def debug_search():
         }
 
 
+# =============================================================================
+# User History & Zep Integration Endpoints
+# =============================================================================
+
+@app.get("/api/user/{user_id}/conversations")
+async def get_user_conversations(user_id: str):
+    """
+    Get all conversation threads for a user from Zep.
+    Returns list of sessions with messages.
+    """
+    from .agent import get_zep_client, ZEP_API_KEY
+    import sys
+
+    if not ZEP_API_KEY:
+        return {"error": "Zep not configured", "conversations": []}
+
+    try:
+        client = get_zep_client()
+        if not client:
+            return {"error": "Zep client unavailable", "conversations": []}
+
+        # Get all threads for this user
+        response = await client.get(
+            f"/api/v2/users/{user_id}/threads",
+        )
+
+        if response.status_code != 200:
+            print(f"[Zep API] Failed to get threads: {response.status_code}", file=sys.stderr)
+            return {"error": f"Zep error: {response.status_code}", "conversations": []}
+
+        threads = response.json()
+        conversations = []
+
+        # Fetch messages for each thread (limit to recent 10 threads)
+        for thread in threads[:10]:
+            thread_id = thread.get("thread_id") or thread.get("id")
+            if not thread_id:
+                continue
+
+            msg_response = await client.get(
+                f"/api/v2/threads/{thread_id}/messages",
+                params={"limit": 50},
+            )
+
+            if msg_response.status_code == 200:
+                messages = msg_response.json()
+                conversations.append({
+                    "session_id": thread_id,
+                    "created_at": thread.get("created_at"),
+                    "messages": messages.get("messages", messages) if isinstance(messages, dict) else messages,
+                })
+
+        return {
+            "user_id": user_id,
+            "conversation_count": len(conversations),
+            "conversations": conversations,
+        }
+
+    except Exception as e:
+        print(f"[Zep API] Error: {e}", file=sys.stderr)
+        return {"error": str(e), "conversations": []}
+
+
+@app.get("/api/user/{user_id}/facts")
+async def get_user_facts(user_id: str):
+    """
+    Get knowledge graph facts about the user from Zep.
+    Returns user profile, preferences, and extracted facts.
+    """
+    from .agent import get_zep_client, ZEP_API_KEY
+    import sys
+
+    if not ZEP_API_KEY:
+        return {"error": "Zep not configured", "facts": []}
+
+    try:
+        client = get_zep_client()
+        if not client:
+            return {"error": "Zep client unavailable", "facts": []}
+
+        # Get user's knowledge graph edges (facts)
+        response = await client.post(
+            "/api/v2/graph/search",
+            json={
+                "user_id": user_id,
+                "query": "user preferences interests topics history",
+                "limit": 50,
+                "scope": "edges",
+            },
+        )
+
+        if response.status_code != 200:
+            print(f"[Zep API] Failed to get facts: {response.status_code}", file=sys.stderr)
+            return {"error": f"Zep error: {response.status_code}", "facts": []}
+
+        data = response.json()
+        edges = data.get("edges", [])
+
+        facts = []
+        for edge in edges:
+            fact = edge.get("fact")
+            if fact:
+                facts.append({
+                    "fact": fact,
+                    "created_at": edge.get("created_at"),
+                    "source": edge.get("source"),
+                    "target": edge.get("target"),
+                })
+
+        return {
+            "user_id": user_id,
+            "fact_count": len(facts),
+            "facts": facts,
+        }
+
+    except Exception as e:
+        print(f"[Zep API] Error: {e}", file=sys.stderr)
+        return {"error": str(e), "facts": []}
+
+
+@app.delete("/api/user/{user_id}/clear")
+async def clear_user_history(user_id: str):
+    """
+    Clear all conversation history and facts for a user.
+    Deletes from both Zep and local user_queries table.
+    """
+    from .agent import get_zep_client, ZEP_API_KEY
+    from .database import get_connection
+    import sys
+
+    results = {
+        "user_id": user_id,
+        "zep_cleared": False,
+        "local_cleared": False,
+        "errors": [],
+    }
+
+    # Clear from Zep
+    if ZEP_API_KEY:
+        try:
+            client = get_zep_client()
+            if client:
+                # Delete user from Zep (cascades to threads and facts)
+                response = await client.delete(f"/api/v2/users/{user_id}")
+                if response.status_code in [200, 204, 404]:
+                    results["zep_cleared"] = True
+                    print(f"[Zep API] Cleared user {user_id}", file=sys.stderr)
+                else:
+                    results["errors"].append(f"Zep delete failed: {response.status_code}")
+        except Exception as e:
+            results["errors"].append(f"Zep error: {str(e)}")
+
+    # Clear from local database
+    try:
+        async with get_connection() as conn:
+            deleted = await conn.execute(
+                "DELETE FROM user_queries WHERE user_id = $1",
+                user_id
+            )
+            results["local_cleared"] = True
+            print(f"[DB] Cleared queries for user {user_id}", file=sys.stderr)
+    except Exception as e:
+        results["errors"].append(f"DB error: {str(e)}")
+
+    results["success"] = results["zep_cleared"] or results["local_cleared"]
+    return results
+
+
 # For local development with uvicorn
 if __name__ == "__main__":
     import uvicorn
