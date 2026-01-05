@@ -1519,19 +1519,32 @@ async def generate_response_with_enrichment(
     suggested_followups = ""
     graph_connections_text = ""
 
+    # Always include topics already discussed (to prevent repetition)
+    if prior_context.topics_discussed:
+        topics_list = prior_context.topics_discussed[-5:]  # Last 5 topics
+        context_enhancement = f"\n\nTOPICS ALREADY DISCUSSED (don't repeat these facts): {', '.join(topics_list)}"
+        context_enhancement += "\nOffer NEW information or acknowledge you've covered this."
+        print(f"[VIC Agent] Topics already discussed: {topics_list}", file=sys.stderr)
+
     if prior_context.enrichment_complete:
         # Include prior entities
         if prior_context.entities:
             entity_names = [e.name for e in prior_context.entities[:5]]
-            context_enhancement = f"\n\nPrior context - entities discussed: {', '.join(entity_names)}"
+            context_enhancement += f"\nEntities mentioned: {', '.join(entity_names)}"
             print(f"[VIC Agent] Using prior context with {len(prior_context.entities)} entities", file=sys.stderr)
 
-        # Include suggested follow-up topics from Zep enrichment
+        # Include suggested follow-up topics from Zep enrichment (excluding already discussed)
         if prior_context.suggestions:
-            suggestion_topics = [s.topic for s in prior_context.suggestions[:3]]
-            suggested_followups = f"\n\nSUGGESTED FOLLOW-UP TOPICS (from knowledge graph): {', '.join(suggestion_topics)}"
-            suggested_followups += "\nUse one of these topics for your follow-up question if relevant."
-            print(f"[VIC Agent] Including {len(prior_context.suggestions)} follow-up suggestions", file=sys.stderr)
+            discussed_lower = {t.lower() for t in prior_context.topics_discussed}
+            fresh_suggestions = [
+                s.topic for s in prior_context.suggestions[:5]
+                if s.topic.lower() not in discussed_lower
+                and not any(d in s.topic.lower() or s.topic.lower() in d for d in discussed_lower)
+            ][:3]
+            if fresh_suggestions:
+                suggested_followups = f"\n\nSUGGESTED FOLLOW-UP TOPICS (NEW - not yet discussed): {', '.join(fresh_suggestions)}"
+                suggested_followups += "\nUse one of these for your follow-up question."
+                print(f"[VIC Agent] Fresh follow-up suggestions: {fresh_suggestions}", file=sys.stderr)
 
         # Include graph connections from Zep
         if prior_context.connections:
