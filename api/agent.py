@@ -668,6 +668,10 @@ def clean_section_references(text: str) -> str:
 _groq_client: Optional[httpx.AsyncClient] = None
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 
+# Google Gemini API client (fallback, more reliable)
+_google_client: Optional[httpx.AsyncClient] = None
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
+
 # Zep for user memory and conversation history
 ZEP_API_KEY = os.environ.get("ZEP_API_KEY", "")
 _zep_client: Optional[httpx.AsyncClient] = None
@@ -972,6 +976,19 @@ def get_groq_client() -> httpx.AsyncClient:
             timeout=15.0,
         )
     return _groq_client
+
+
+def get_google_client() -> httpx.AsyncClient:
+    """Get or create persistent Google Gemini HTTP client."""
+    global _google_client
+    if _google_client is None:
+        _google_client = httpx.AsyncClient(
+            base_url="https://generativelanguage.googleapis.com/v1beta",
+            params={"key": GOOGLE_API_KEY},
+            headers={"Content-Type": "application/json"},
+            timeout=30.0,  # Gemini can be slower
+        )
+    return _google_client
 
 # System prompt that defines Vic's persona and strict grounding rules
 # This is the SINGLE SOURCE OF TRUTH - frontend only sends user context
@@ -1876,14 +1893,15 @@ You MUST return a JSON with:
             response_text = validated_data.response_text
 
         except Exception as agent_error:
-            # Fallback to direct Groq call if Pydantic AI agent fails
-            print(f"[VIC Agent] Agent failed ({type(agent_error).__name__}: {str(agent_error)[:100]}), falling back to direct Groq", file=sys.stderr)
+            # Fallback to direct Google Gemini call if Pydantic AI agent fails
+            print(f"[VIC Agent] Agent failed ({type(agent_error).__name__}: {str(agent_error)[:100]}), falling back to Google Gemini", file=sys.stderr)
 
-            # Wait a moment before fallback to avoid rate limits
-            await asyncio.sleep(0.5)
+            try:
+                # Wait a moment before fallback to avoid rate limits
+                await asyncio.sleep(0.3)
 
-            client = get_groq_client()
-            fallback_prompt = f"""Question: "{user_message}"
+                client = get_google_client()
+                fallback_prompt = f"""Question: "{user_message}"
 {name_instruction}
 
 Source material:
@@ -1891,25 +1909,30 @@ Source material:
 
 Respond naturally using facts from above. Keep it conversational and under 150 words."""
 
-            llm_response = await client.post(
-                "/chat/completions",
-                json={
-                    "model": "llama-3.1-8b-instant",
-                    "max_tokens": 250,
-                    "messages": [
-                        {"role": "system", "content": VIC_SYSTEM_PROMPT},
-                        {"role": "user", "content": fallback_prompt},
-                    ],
-                },
-            )
-            llm_response.raise_for_status()
-            data = llm_response.json()
-            response_text = data["choices"][0]["message"]["content"]
+                llm_response = await client.post(
+                    "/models/gemini-2.0-flash:generateContent",
+                    json={
+                        "contents": [
+                            {"role": "user", "parts": [{"text": f"{VIC_SYSTEM_PROMPT}\n\n{fallback_prompt}"}]}
+                        ],
+                        "generationConfig": {
+                            "maxOutputTokens": 300,
+                            "temperature": 0.7,
+                        },
+                    },
+                )
+                llm_response.raise_for_status()
+                data = llm_response.json()
+                response_text = data["candidates"][0]["content"]["parts"][0]["text"]
 
-            # Clean up response
-            import re
-            response_text = re.sub(r'\n*TOPIC_CHECK:.*$', '', response_text, flags=re.DOTALL | re.IGNORECASE)
-            response_text = response_text.strip()
+                # Clean up response
+                import re
+                response_text = re.sub(r'\n*TOPIC_CHECK:.*$', '', response_text, flags=re.DOTALL | re.IGNORECASE)
+                response_text = response_text.strip()
+            except Exception as fallback_error:
+                # Both failed - raise to outer handler
+                print(f"[VIC Agent] Fallback also failed: {type(fallback_error).__name__}: {str(fallback_error)[:100]}", file=sys.stderr)
+                raise fallback_error
 
         # Additional post-validation for hallucination patterns
         validated_response = post_validate_response(response_text, source_content)

@@ -163,13 +163,13 @@ def create_fast_agent() -> Agent[VICAgentDeps, FastVICResponse]:
     """
     Create the fast-path agent for immediate responses.
 
-    Uses Groq Llama 3.3 70B for fast, reliable structured output.
-    - 70B model has better instruction following for JSON schemas
-    - Native tool-use support in Groq API
-    - Target latency: <2 seconds total.
+    Uses Google Gemini 2.0 Flash for reliable structured output.
+    - Flash model is fast and reliable
+    - Good JSON schema support
+    - Target latency: <3 seconds total.
     """
     return Agent(
-        'groq:llama-3.3-70b-versatile',
+        'google-gla:gemini-2.0-flash',
         deps_type=VICAgentDeps,
         result_type=FastVICResponse,
         system_prompt=FAST_SYSTEM_PROMPT,
@@ -177,7 +177,7 @@ def create_fast_agent() -> Agent[VICAgentDeps, FastVICResponse]:
         retries=2,
         model_settings={
             'temperature': 0.7,
-            'max_tokens': 300,
+            'max_output_tokens': 300,
         },
     )
 
@@ -203,7 +203,7 @@ def create_enriched_agent() -> Agent[VICAgentDeps, EnrichedVICResponse]:
     )
 
     return Agent(
-        'groq:llama-3.1-8b-instant',
+        'google-gla:gemini-2.0-flash',
         deps_type=VICAgentDeps,
         result_type=EnrichedVICResponse,
         system_prompt=ENRICHED_SYSTEM_PROMPT,
@@ -217,7 +217,7 @@ def create_enriched_agent() -> Agent[VICAgentDeps, EnrichedVICResponse]:
         retries=2,
         model_settings={
             'temperature': 0.7,
-            'max_tokens': 500,  # More room for detailed analysis
+            'max_output_tokens': 500,  # More room for detailed analysis
         },
     )
 
