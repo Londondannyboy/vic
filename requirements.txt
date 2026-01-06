@@ -5,12 +5,9 @@
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
 
-# Pydantic AI for agent + validation
-pydantic-ai>=0.0.14
+# Pydantic AI for agent + validation (includes Gemini support)
+pydantic-ai[google]>=0.0.14
 pydantic>=2.10.0
-
-# Google Gemini for reliable LLM responses
-google-generativeai>=0.8.0
 
 # OpenAI types for CLM response format
 openai>=1.58.0
