@@ -16,12 +16,6 @@ LOST_LONDON_GRAPH_ID = "lost-london"
 # OPTIMIZATION: Persistent HTTP clients for connection reuse
 _voyage_client: Optional[httpx.AsyncClient] = None
 
-# OPTIMIZATION: Cache for embeddings and search results
-# Structure: {query: {"embedding": [...], "timestamp": float}}
-_embedding_cache: dict[str, dict] = {}
-EMBEDDING_CACHE_TTL_SECONDS = 600  # 10 minutes
-MAX_EMBEDDING_CACHE_SIZE = 200
-
 
 def get_voyage_client() -> httpx.AsyncClient:
     """Get or create persistent Voyage HTTP client."""
@@ -39,155 +33,42 @@ def get_voyage_client() -> httpx.AsyncClient:
 
 
 # Phonetic corrections for voice input - matching lost.london
-# Common speech recognition misinterpretations of London historical terms
 PHONETIC_CORRECTIONS: dict[str, str] = {
-    # === NAMES (Historical Figures) ===
+    # Names
     "ignacio": "ignatius",
     "ignasio": "ignatius",
     "ignacius": "ignatius",
-    "vic keegan": "vic keegan",  # Ensure correct spelling
-    "victor keegan": "vic keegan",
-    "samuel pepys": "samuel pepys",
-    "peeps": "pepys",
-    "peepis": "pepys",
-    "samuel peeps": "samuel pepys",
-    "brunel": "brunel",
-    "brunell": "brunel",
-    "christofer wren": "christopher wren",
-    "sir christofer": "sir christopher",
-
-    # === THORNEY ISLAND (Common Mishearings) ===
+    # Places
     "thorny": "thorney",
     "fawny": "thorney",
     "fauny": "thorney",
     "forney": "thorney",
-    "thorny island": "thorney island",
-    "tawny island": "thorney island",
-    "tourney island": "thorney island",
-
-    # === TYBURN (Execution Site) ===
     "tie burn": "tyburn",
     "tieburn": "tyburn",
-    "tie-burn": "tyburn",
-    "tiburn": "tyburn",
-    "tyler burn": "tyburn",
-    "tybourne": "tyburn",
-
-    # === PLACES (London Areas) ===
     "aquarim": "aquarium",
     "aquariam": "aquarium",
-    "aquarium royale": "royal aquarium",
     "royale": "royal",
     "cristal": "crystal",
     "crystle": "crystal",
-    "crystal palice": "crystal palace",
     "shakespear": "shakespeare",
     "shakespere": "shakespeare",
     "westmister": "westminster",
-    "westminister": "westminster",
-    "west minster": "westminster",
     "white hall": "whitehall",
-    "white-hall": "whitehall",
     "parliment": "parliament",
     "tems": "thames",
-    "temms": "thames",
-    "the tems": "the thames",
     "devils acre": "devil's acre",
     "devil acre": "devil's acre",
-    "devils acor": "devil's acre",
-
-    # === LONDON NEIGHBORHOODS ===
+    # Additional corrections
     "voxhall": "vauxhall",
     "vox hall": "vauxhall",
-    "vox-hall": "vauxhall",
-    "foxhall": "vauxhall",
     "southwork": "southwark",
-    "south work": "southwark",
-    "south-work": "southwark",
     "grenwich": "greenwich",
-    "green witch": "greenwich",
     "wolwich": "woolwich",
-    "wool witch": "woolwich",
     "bermondsy": "bermondsey",
-    "bermonsey": "bermondsey",
     "holbourn": "holborn",
-    "hol born": "holborn",
     "aldwich": "aldwych",
-    "ald witch": "aldwych",
     "chisick": "chiswick",
-    "chis wick": "chiswick",
     "dulwitch": "dulwich",
-    "dull witch": "dulwich",
-    "pimlyco": "pimlico",
-    "pim li co": "pimlico",
-    "islinton": "islington",
-    "kennington": "kennington",
-    "kenington": "kennington",
-    "lamberth": "lambeth",
-    "lam beth": "lambeth",
-    "shoredich": "shoreditch",
-    "shore ditch": "shoreditch",
-    "finsbry": "finsbury",
-    "fins berry": "finsbury",
-    "marylbone": "marylebone",
-    "mary le bone": "marylebone",
-    "mary-le-bone": "marylebone",
-    "clerkenwell": "clerkenwell",
-    "clarken well": "clerkenwell",
-
-    # === BRIDGES & LANDMARKS ===
-    "london bridge": "london bridge",
-    "blackfryers": "blackfriars",
-    "black friars": "blackfriars",
-    "black-friars": "blackfriars",
-    "waterlow": "waterloo",
-    "water lou": "waterloo",
-    "tower of london": "tower of london",
-    "towre": "tower",
-    "st pauls": "st paul's",
-    "saint pauls": "st paul's",
-    "big ben": "big ben",
-    "trafalger": "trafalgar",
-    "trafalgar sqare": "trafalgar square",
-
-    # === RIVERS (Hidden London) ===
-    "fleet river": "river fleet",
-    "the fleet": "fleet",
-    "westbourne": "westbourne",
-    "west bourne": "westbourne",
-    "effra": "effra",
-    "efra": "effra",
-    "tyburn stream": "tyburn",
-    "walbrook": "walbrook",
-    "wall brook": "walbrook",
-    "neck inger": "neckinger",
-    "neckenger": "neckinger",
-
-    # === ERAS (Historical Periods) ===
-    "victorian": "victorian",
-    "victorean": "victorian",
-    "georgian": "georgian",
-    "gorgeon": "georgian",
-    "medival": "medieval",
-    "medievil": "medieval",
-    "tudor": "tudor",
-    "tuder": "tudor",
-    "elizabethen": "elizabethan",
-    "elizebethan": "elizabethan",
-
-    # === ENTERTAINMENT VENUES ===
-    "music hall": "music hall",
-    "musick hall": "music hall",
-    "alambra": "alhambra",
-    "al hambra": "alhambra",
-    "colliseum": "coliseum",
-    "colosseum": "coliseum",
-    "hipodrome": "hippodrome",
-    "hippo drome": "hippodrome",
-    "lycuem": "lyceum",
-    "li see um": "lyceum",
-    "astleys": "astley's",
-    "astlies": "astley's",
 }
 
 
@@ -205,30 +86,7 @@ def normalize_query(query: str) -> str:
 
 
 async def get_voyage_embedding(text: str) -> list[float]:
-    """Generate embedding using Voyage AI with caching for common queries."""
-    import time
-    import sys
-
-    global _embedding_cache
-
-    # Normalize text for cache key
-    cache_key = text.lower().strip()
-    current_time = time.time()
-
-    # Check cache
-    if cache_key in _embedding_cache:
-        cached = _embedding_cache[cache_key]
-        age = current_time - cached["timestamp"]
-        if age < EMBEDDING_CACHE_TTL_SECONDS:
-            print(f"[VIC Cache] Embedding cache HIT for '{cache_key[:30]}...' (age: {age:.1f}s)", file=sys.stderr)
-            return cached["embedding"]
-        else:
-            # Expired - remove from cache
-            del _embedding_cache[cache_key]
-
-    # Cache miss - generate new embedding
-    print(f"[VIC Cache] Embedding cache MISS for '{cache_key[:30]}...'", file=sys.stderr)
-
+    """Generate embedding using Voyage AI with persistent client."""
     client = get_voyage_client()
     response = await client.post(
         "/v1/embeddings",
@@ -240,20 +98,7 @@ async def get_voyage_embedding(text: str) -> list[float]:
     )
     response.raise_for_status()
     data = response.json()
-    embedding = data["data"][0]["embedding"]
-
-    # Store in cache
-    if len(_embedding_cache) >= MAX_EMBEDDING_CACHE_SIZE:
-        # Evict oldest entry
-        oldest_key = min(_embedding_cache.items(), key=lambda x: x[1]["timestamp"])[0]
-        del _embedding_cache[oldest_key]
-
-    _embedding_cache[cache_key] = {
-        "embedding": embedding,
-        "timestamp": current_time,
-    }
-
-    return embedding
+    return data["data"][0]["embedding"]
 
 
 async def search_zep_graph(query: str) -> dict:

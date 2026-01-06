@@ -26,12 +26,6 @@ from .models import (
 from .tools import search_articles, get_user_memory
 from .agent_deps import VICAgentDeps
 from .agent_config import get_fast_agent, get_enriched_agent, VIC_SYSTEM_PROMPT, SAFE_TOPIC_CLUSTERS
-from .validation import (
-    validate_user_input,
-    should_store_to_zep,
-    fast_content_check,
-    ContentCategory,
-)
 
 # Lazy-loaded agent instance (legacy)
 _vic_agent: Optional[Agent] = None
@@ -55,72 +49,6 @@ class SessionContext:
     name_used_in_greeting: bool = False
     # Track the last suggestion VIC made for affirmation handling
     last_suggested_topic: str = ""
-    # Track the current topic for switch detection
-    current_topic: str = ""
-    # Flag if we're waiting for topic switch confirmation
-    pending_topic_switch: str = ""
-    # Track last interaction time for returning user detection
-    last_interaction_time: float = 0.0
-    # Track if this is first interaction in session
-    greeted_this_session: bool = False
-    # Track user's emotional state from Hume
-    user_emotion: str = ""
-
-
-# Emotion-based response adjustments
-EMOTION_ADJUSTMENTS = {
-    "confused": "Explain simply and clearly. Use short sentences.",
-    "interested": "Share more detail and enthusiasm. Add fascinating facts.",
-    "excited": "Match their energy. Be enthusiastic.",
-    "bored": "Keep it brief. Offer to switch topics.",
-    "contemplative": "Give them space to think. Ask thoughtful questions.",
-    "curious": "Encourage their curiosity. Offer to go deeper.",
-    "skeptical": "Be precise with facts. Cite your sources.",
-}
-
-# Confidence thresholds for response softening
-# RRF scores are typically in 0.01-0.03 range for good matches
-HIGH_CONFIDENCE_THRESHOLD = 0.025  # Very relevant results
-MEDIUM_CONFIDENCE_THRESHOLD = 0.015  # Decent match
-LOW_CONFIDENCE_THRESHOLD = 0.01  # Weak match
-
-# Softening phrases for low confidence responses
-UNCERTAINTY_PHRASES = [
-    "I believe",
-    "From what I recall",
-    "If I remember correctly",
-    "I think",
-    "As far as I know",
-]
-
-HIGH_CONFIDENCE_PHRASES = [
-    "I can tell you with certainty that",
-    "Absolutely,",
-    "Without a doubt,",
-    "I'm quite certain that",
-    "I remember this well -",
-]
-
-# "I'm not sure" responses for when we can't find good matches
-UNCERTAINTY_RESPONSES = [
-    "I'm not entirely sure I have the right information on that. Let me tell you what I do know...",
-    "That's a good question, though I must admit my articles don't cover that specifically.",
-    "I want to be honest - I'm not certain I have the exact answer you're looking for.",
-    "I don't seem to have detailed information on that particular aspect.",
-    "My collection doesn't appear to cover that directly, but here's what I can share...",
-]
-
-# Graceful "no match" responses - offer alternatives
-NO_MATCH_RESPONSES = [
-    "I don't have any articles about that in my collection, I'm afraid. Would you like to try a different topic?",
-    "That's outside my areas of research. Shall I suggest something from my collection instead?",
-    "I don't seem to have written about that one. Would you like me to recommend something similar?",
-    "I'm afraid that's not in my collection. I specialise in London's hidden history - is there something along those lines I could help with?",
-]
-
-
-# Time gap (in seconds) after which user is considered "returning"
-RETURNING_USER_GAP_SECONDS = 600  # 10 minutes
 
 
 # Affirmation patterns - user confirming a suggestion
@@ -135,59 +63,10 @@ AFFIRMATION_PHRASES = {
     "let's do it", "let's hear it", "why not", "i'm interested", "please do",
 }
 
-# Topic switch indicators - phrases that signal a new topic
-TOPIC_SWITCH_PHRASES = {
-    "tell me about", "what about", "how about", "let's talk about",
-    "i want to know about", "can you tell me about", "what do you know about",
-    "switch to", "change topic", "different topic", "something else",
-    "actually", "instead", "rather", "actually tell me", "forget that",
-}
-
-# Yes/No prefixes to strip from queries - these are confirmations, not search terms
-YES_NO_PREFIXES = [
-    "yes", "yeah", "yep", "yup", "no", "nah", "nope",
-    "sure", "okay", "ok", "right", "correct", "exactly",
-    "yes please", "no thanks", "yes i would", "no i wouldn't",
-]
-
-
-def clean_query(query: str) -> str:
-    """
-    Clean a query by removing yes/no confirmation prefixes.
-
-    "Yes, the Royal Aquarium" -> "the Royal Aquarium"
-    "Yeah tell me about Fleet Street" -> "tell me about Fleet Street"
-    "No, I meant Thorney Island" -> "I meant Thorney Island"
-    """
-    cleaned = query.strip()
-    lower = cleaned.lower()
-
-    # Check for yes/no prefixes followed by comma or space
-    for prefix in sorted(YES_NO_PREFIXES, key=len, reverse=True):  # Longest first
-        # Check with comma: "Yes, the Royal Aquarium"
-        if lower.startswith(prefix + ","):
-            cleaned = cleaned[len(prefix) + 1:].strip()
-            break
-        # Check with space and then more content: "Yes the Royal Aquarium"
-        elif lower.startswith(prefix + " ") and len(cleaned) > len(prefix) + 3:
-            rest = cleaned[len(prefix):].strip()
-            # Make sure there's actual content after the prefix
-            if rest and not rest.lower() in YES_NO_PREFIXES:
-                cleaned = rest
-                break
-
-    return cleaned
-
 
 # LRU-style session store (max 100 sessions)
 _session_contexts: dict[str, SessionContext] = {}
 MAX_SESSIONS = 100
-
-# Popular topics tracking - tracks frequency of queries
-# Structure: {normalized_topic: {"count": int, "last_asked": timestamp}}
-_popular_topics: dict[str, dict] = {}
-MAX_TRACKED_TOPICS = 500
-TOPIC_DECAY_HOURS = 24  # Topics older than this have reduced weight
 
 
 def get_session_context(session_id: Optional[str]) -> SessionContext:
@@ -203,89 +82,6 @@ def get_session_context(session_id: Optional[str]) -> SessionContext:
         _session_contexts[session_id] = SessionContext()
 
     return _session_contexts[session_id]
-
-
-def track_topic(topic: str, article_titles: list[str] = None) -> None:
-    """
-    Track a topic that was asked about for popularity metrics.
-
-    Args:
-        topic: The normalized topic/query
-        article_titles: Optional list of articles that matched
-    """
-    import time
-
-    global _popular_topics
-
-    # Normalize the topic
-    normalized = topic.lower().strip()
-    if len(normalized) < 3:
-        return
-
-    # Update tracking
-    current_time = time.time()
-
-    if normalized in _popular_topics:
-        _popular_topics[normalized]["count"] += 1
-        _popular_topics[normalized]["last_asked"] = current_time
-    else:
-        # Evict old entries if at capacity
-        if len(_popular_topics) >= MAX_TRACKED_TOPICS:
-            # Remove least recently asked topic
-            oldest = min(_popular_topics.items(), key=lambda x: x[1]["last_asked"])
-            del _popular_topics[oldest[0]]
-
-        _popular_topics[normalized] = {
-            "count": 1,
-            "last_asked": current_time,
-            "articles": article_titles or [],
-        }
-
-
-def get_popular_topics(limit: int = 10) -> list[tuple[str, int]]:
-    """
-    Get the most popular topics with decay weighting.
-
-    Returns list of (topic, weighted_count) tuples sorted by popularity.
-    """
-    import time
-
-    current_time = time.time()
-    decay_seconds = TOPIC_DECAY_HOURS * 3600
-
-    weighted_topics = []
-    for topic, data in _popular_topics.items():
-        age = current_time - data["last_asked"]
-        # Apply decay: recent topics weighted more heavily
-        decay_factor = max(0.1, 1.0 - (age / decay_seconds))
-        weighted_count = data["count"] * decay_factor
-        weighted_topics.append((topic, weighted_count, data.get("articles", [])))
-
-    # Sort by weighted count
-    weighted_topics.sort(key=lambda x: x[1], reverse=True)
-
-    return [(t[0], int(t[1]), t[2]) for t in weighted_topics[:limit]]
-
-
-def get_topic_suggestion_from_popular() -> Optional[str]:
-    """
-    Get a topic suggestion based on what's popular.
-
-    Returns a topic that other users have been interested in.
-    """
-    import random
-
-    popular = get_popular_topics(limit=20)
-    if not popular:
-        return None
-
-    # Pick from top 5 most popular
-    top_topics = popular[:5]
-    if top_topics:
-        chosen = random.choice(top_topics)
-        return chosen[0].title()  # Return properly capitalized
-
-    return None
 
 
 def update_session_context(session_id: Optional[str], context: SessionContext) -> None:
@@ -403,235 +199,6 @@ def set_last_suggestion(session_id: Optional[str], topic: str) -> None:
     update_session_context(session_id, context)
 
 
-def detect_topic_switch(message: str, session_id: Optional[str]) -> tuple[bool, str, str]:
-    """
-    Detect if the user is switching to a new topic.
-
-    Returns (is_switch, new_topic, confirmation_prompt):
-    - (True, "Fleet Street", "Ah, Fleet Street? Let me look that up...") = clear topic switch
-    - (False, "", "") = not a topic switch, continue normally
-    """
-    if not session_id:
-        return (False, "", "")
-
-    context = get_session_context(session_id)
-    current_topic = context.current_topic
-    message_lower = message.lower().strip()
-
-    # Check if message contains topic switch indicators
-    has_switch_phrase = any(phrase in message_lower for phrase in TOPIC_SWITCH_PHRASES)
-
-    # Extract potential new topic from the message
-    new_topic = ""
-    for phrase in TOPIC_SWITCH_PHRASES:
-        if phrase in message_lower:
-            # Get text after the switch phrase
-            idx = message_lower.find(phrase)
-            after = message[idx + len(phrase):].strip().rstrip('?.!')
-            if after:
-                new_topic = after
-                break
-
-    # If no switch phrase found, check if it's just a new topic mentioned
-    if not new_topic:
-        # Simple heuristic: if message is short and doesn't seem like a follow-up
-        words = message_lower.split()
-        if len(words) <= 5 and current_topic:
-            # Check if any significant word from current topic is in new message
-            current_words = set(current_topic.lower().split())
-            message_words = set(words)
-            overlap = current_words & message_words
-            # If no overlap and it looks like a topic, it's a switch
-            if not overlap and not any(w in AFFIRMATION_WORDS for w in words):
-                new_topic = message.strip().rstrip('?.!')
-
-    # If we detected a new topic different from current
-    if new_topic and current_topic:
-        # Check if it's actually different
-        if new_topic.lower() not in current_topic.lower() and current_topic.lower() not in new_topic.lower():
-            confirmation = f"Ah, {new_topic}? Let me see what I have on that..."
-            return (True, new_topic, confirmation)
-
-    return (False, "", "")
-
-
-def set_current_topic(session_id: Optional[str], topic: str) -> None:
-    """Update the current topic being discussed."""
-    if not session_id:
-        return
-    context = get_session_context(session_id)
-    context.current_topic = topic
-    # Clear pending switch when we set a new topic
-    context.pending_topic_switch = ""
-    update_session_context(session_id, context)
-
-
-def set_pending_topic_switch(session_id: Optional[str], topic: str) -> None:
-    """Mark that we're waiting for confirmation on a topic switch."""
-    if not session_id:
-        return
-    context = get_session_context(session_id)
-    context.pending_topic_switch = topic
-    update_session_context(session_id, context)
-
-
-def get_pending_topic_switch(session_id: Optional[str]) -> Optional[str]:
-    """Get any pending topic switch awaiting confirmation."""
-    if not session_id:
-        return None
-    context = get_session_context(session_id)
-    return context.pending_topic_switch if context.pending_topic_switch else None
-
-
-def clear_pending_topic_switch(session_id: Optional[str]) -> None:
-    """Clear the pending topic switch."""
-    if not session_id:
-        return
-    context = get_session_context(session_id)
-    context.pending_topic_switch = ""
-    update_session_context(session_id, context)
-
-
-def check_returning_user(session_id: Optional[str]) -> tuple[bool, Optional[str]]:
-    """
-    Check if this is a returning user (after a time gap).
-
-    Returns (is_returning, last_topic):
-    - (True, "Trafalgar Square") = user is back after gap, was discussing this
-    - (False, None) = same session or new user
-    """
-    import time
-
-    if not session_id:
-        return (False, None)
-
-    context = get_session_context(session_id)
-
-    # If already greeted this session, not returning
-    if context.greeted_this_session:
-        return (False, None)
-
-    # If no previous interaction, not returning
-    if context.last_interaction_time == 0:
-        return (False, None)
-
-    # Check time gap
-    current_time = time.time()
-    gap = current_time - context.last_interaction_time
-
-    if gap >= RETURNING_USER_GAP_SECONDS and context.current_topic:
-        return (True, context.current_topic)
-
-    return (False, None)
-
-
-def update_interaction_time(session_id: Optional[str]) -> None:
-    """Update the last interaction time."""
-    import time
-
-    if not session_id:
-        return
-
-    context = get_session_context(session_id)
-    context.last_interaction_time = time.time()
-    update_session_context(session_id, context)
-
-
-def mark_greeted_this_session(session_id: Optional[str]) -> None:
-    """Mark that we've greeted the user this session."""
-    if not session_id:
-        return
-
-    context = get_session_context(session_id)
-    context.greeted_this_session = True
-    update_session_context(session_id, context)
-
-
-def set_user_emotion(session_id: Optional[str], emotion: str) -> None:
-    """Store the user's detected emotion."""
-    if not session_id:
-        return
-
-    context = get_session_context(session_id)
-    context.user_emotion = emotion
-    update_session_context(session_id, context)
-
-
-def get_emotion_adjustment(session_id: Optional[str]) -> str:
-    """Get response adjustment based on user's emotion."""
-    if not session_id:
-        return ""
-
-    context = get_session_context(session_id)
-    emotion = context.user_emotion.lower()
-
-    # Find matching emotion adjustment
-    for emotion_key, adjustment in EMOTION_ADJUSTMENTS.items():
-        if emotion_key in emotion:
-            return f"\n\nUSER EMOTION: {emotion}. {adjustment}"
-
-    return ""
-
-
-def extract_emotion_from_message(content: str) -> tuple[str, str]:
-    """
-    Extract emotion tags from Hume message content.
-
-    Returns (cleaned_content, emotion_string):
-    - "Tell me about X {interested, curious}" -> ("Tell me about X", "interested, curious")
-    """
-    import re
-
-    emotion = ""
-    cleaned = content
-
-    # Match emotion tags like {interested, curious, contemplative}
-    match = re.search(r'\s*\{([^}]+)\}\s*$', content)
-    if match:
-        emotion = match.group(1).strip()
-        cleaned = content[:match.start()].strip()
-
-    return (cleaned, emotion)
-
-
-def get_confidence_level(search_scores: list[float]) -> tuple[str, str]:
-    """
-    Assess confidence level based on search result scores.
-
-    Returns (level, instruction):
-    - ("high", "Be confident and authoritative")
-    - ("medium", "Be helpful but measured")
-    - ("low", "Soften claims and acknowledge uncertainty")
-    """
-    import random
-
-    if not search_scores:
-        return ("low", "")
-
-    # Use the best score
-    best_score = max(search_scores)
-
-    if best_score >= HIGH_CONFIDENCE_THRESHOLD:
-        # High confidence - be authoritative
-        phrase = random.choice(HIGH_CONFIDENCE_PHRASES)
-        return ("high", f"\n\nCONFIDENCE: HIGH. You can be confident about these facts. Feel free to start with '{phrase}'")
-
-    elif best_score >= MEDIUM_CONFIDENCE_THRESHOLD:
-        # Medium confidence - be helpful but measured
-        return ("medium", "\n\nCONFIDENCE: MEDIUM. Present facts confidently but don't overclaim.")
-
-    elif best_score >= LOW_CONFIDENCE_THRESHOLD:
-        # Low confidence - soften claims
-        phrase = random.choice(UNCERTAINTY_PHRASES)
-        uncertainty_intro = random.choice(UNCERTAINTY_RESPONSES)
-        return ("low", f"\n\nCONFIDENCE: LOW. The match isn't strong. Consider starting with: '{uncertainty_intro}' Use softening phrases like '{phrase}'.")
-
-    else:
-        # Very low confidence - be honest about uncertainty
-        uncertainty_intro = random.choice(UNCERTAINTY_RESPONSES)
-        return ("very_low", f"\n\nCONFIDENCE: VERY LOW. Start with: '{uncertainty_intro}' Be honest that this might not be exactly what they're looking for. Offer to help with something else.")
-
-
 def clean_section_references(text: str) -> str:
     """
     Remove section/page/chapter references from text.
@@ -667,10 +234,6 @@ def clean_section_references(text: str) -> str:
 # OPTIMIZATION: Persistent HTTP client for Groq API (connection reuse)
 _groq_client: Optional[httpx.AsyncClient] = None
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-
-# Google Gemini API client (fallback, more reliable)
-_google_client: Optional[httpx.AsyncClient] = None
-GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
 
 # Zep for user memory and conversation history
 ZEP_API_KEY = os.environ.get("ZEP_API_KEY", "")
@@ -772,145 +335,6 @@ async def get_conversation_history(session_id: Optional[str]) -> list[dict]:
         return []
 
 
-async def store_unvalidated_interest(
-    user_id: str,
-    session_id: Optional[str],
-    topic: str,
-    article_title: Optional[str] = None,
-) -> None:
-    """
-    Store interest to Zep immediately but marked as UNVALIDATED.
-
-    This allows VIC to remember conversation context, but the interest
-    is flagged as unconfirmed. When user validates in dashboard,
-    a separate validated fact is added.
-    """
-    import sys
-
-    if not ZEP_API_KEY:
-        return
-
-    try:
-        client = get_zep_client()
-        if not client:
-            return
-
-        # Ensure user exists
-        await client.post(
-            "/api/v2/users",
-            json={"user_id": user_id},
-        )
-
-        # Store fact with validated=false metadata
-        fact_text = f"User discussed {article_title}" if article_title else f"User asked about {topic}"
-
-        await client.post(
-            f"/api/v2/users/{user_id}/facts",
-            json={
-                "facts": [fact_text],
-                "metadata": {
-                    "validated": False,  # Marked as unvalidated
-                    "pending_confirmation": True,
-                    "article_title": article_title,
-                    "source": "conversation",
-                    "session_id": session_id,
-                },
-            },
-        )
-        print(f"[VIC Zep] Stored unvalidated interest: {article_title or topic}", file=sys.stderr)
-
-    except Exception as e:
-        print(f"[VIC Zep] Error storing unvalidated interest: {e}", file=sys.stderr)
-
-
-async def get_pending_interest_count(user_id: str) -> int:
-    """Get count of pending interests awaiting user confirmation."""
-    import os
-
-    try:
-        frontend_url = os.environ.get("FRONTEND_URL", "https://lost.london")
-
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            # This endpoint needs auth, so we'll use a simple count endpoint
-            response = await client.get(
-                f"{frontend_url}/api/interests/count",
-                params={"userId": user_id},
-            )
-            if response.status_code == 200:
-                data = response.json()
-                return data.get("pending", 0)
-    except Exception:
-        pass
-    return 0
-
-
-def get_validation_encouragement(pending_count: int) -> str:
-    """Get an encouragement message for users with pending interests."""
-    import random
-
-    if pending_count == 0:
-        return ""
-
-    if pending_count == 1:
-        prompts = [
-            "\n\nBy the way, I noticed a topic you might be interested in. You can confirm it in your dashboard to help me remember what you like.",
-            "\n\nOh, and there's a topic waiting for you to confirm in your dashboard - it helps me personalize our conversations!",
-        ]
-    elif pending_count <= 3:
-        prompts = [
-            f"\n\nI've noted {pending_count} topics you've explored. Pop over to your dashboard when you get a chance to confirm which ones interest you most!",
-            f"\n\nThere are {pending_count} topics awaiting your confirmation in the dashboard. It really helps me tailor our chats to your interests.",
-        ]
-    else:
-        prompts = [
-            f"\n\nYou've got {pending_count} topics waiting for confirmation! Your dashboard is eager to hear which ones truly caught your fancy.",
-            f"\n\nWe've covered quite a bit! {pending_count} topics are pending your review in the dashboard - do let me know which ones interest you.",
-        ]
-
-    return random.choice(prompts)
-
-
-async def create_pending_interest(
-    user_id: str,
-    topic: str,
-    article_id: Optional[int] = None,
-    article_title: Optional[str] = None,
-    article_slug: Optional[str] = None,
-) -> None:
-    """
-    Create a pending interest for human-in-the-loop validation.
-
-    The interest is stored as "pending" and displayed in the user's dashboard.
-    Only when the user confirms it does it get stored to Zep.
-    """
-    import sys
-    import os
-
-    try:
-        frontend_url = os.environ.get("FRONTEND_URL", "https://lost.london")
-
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.post(
-                f"{frontend_url}/api/interests",
-                json={
-                    "userId": user_id,
-                    "topic": topic,
-                    "articleId": article_id,
-                    "articleTitle": article_title,
-                    "articleSlug": article_slug,
-                    "source": "conversation",
-                },
-            )
-
-            if response.status_code == 200:
-                print(f"[VIC Pending] ✓ Created pending interest: {topic[:30]}... (article: {article_title})", file=sys.stderr)
-            else:
-                print(f"[VIC Pending] ✗ Failed to create pending interest: {response.status_code}", file=sys.stderr)
-
-    except Exception as e:
-        print(f"[VIC Pending] Error creating pending interest: {e}", file=sys.stderr)
-
-
 async def store_conversation_message(session_id: Optional[str], user_id: Optional[str], role: str, content: str) -> None:
     """Store conversation message in Zep for history and fact extraction."""
     if not session_id or not ZEP_API_KEY:
@@ -976,19 +400,6 @@ def get_groq_client() -> httpx.AsyncClient:
             timeout=15.0,
         )
     return _groq_client
-
-
-def get_google_client() -> httpx.AsyncClient:
-    """Get or create persistent Google Gemini HTTP client."""
-    global _google_client
-    if _google_client is None:
-        _google_client = httpx.AsyncClient(
-            base_url="https://generativelanguage.googleapis.com/v1beta",
-            params={"key": GOOGLE_API_KEY},
-            headers={"Content-Type": "application/json"},
-            timeout=30.0,  # Gemini can be slower
-        )
-    return _google_client
 
 # System prompt that defines Vic's persona and strict grounding rules
 # This is the SINGLE SOURCE OF TRUTH - frontend only sends user context
@@ -1255,15 +666,6 @@ async def generate_response(user_message: str, session_id: Optional[str] = None,
             similarity_threshold=0.3,  # Lower threshold
         )
 
-        # Filter out duplicate articles (use canonical versions only)
-        from .database import get_duplicate_article_ids
-        duplicate_ids = await get_duplicate_article_ids()
-        if duplicate_ids:
-            original_count = len(results)
-            results = [r for r in results if int(r.get('id', 0)) not in duplicate_ids]
-            if len(results) < original_count:
-                print(f"[VIC Search] Filtered {original_count - len(results)} duplicate articles", file=sys.stderr)
-
         print(f"[VIC Search] Found {len(results)} articles", file=sys.stderr)
         for r in results[:3]:
             print(f"[VIC Search]   - {r.get('title', 'NO TITLE')[:50]} (score: {r.get('score', 0):.4f})", file=sys.stderr)
@@ -1277,19 +679,6 @@ async def generate_response(user_message: str, session_id: Optional[str] = None,
         article_titles = [r['title'] for r in results] if results else []
         graph_connections = graph_data.get("connections", [])
         graph_facts = graph_data.get("facts", [])
-
-        # Store user query for history tracking (non-blocking)
-        if user_id and results:
-            from .database import store_user_query
-            top_result = results[0]
-            asyncio.create_task(store_user_query(
-                user_id=user_id,
-                query=user_message,
-                article_id=int(top_result.get('id')) if top_result.get('id') else None,
-                article_title=top_result.get('title'),
-                article_slug=top_result.get('title', '').lower().replace(' ', '-').replace("'", ''),
-                session_id=session_id
-            ))
 
         if not results:
             validation_notes.append("No articles found for query")
@@ -1613,25 +1002,8 @@ async def run_enrichment(
         current_topic = source_titles[0] if source_titles else user_message
         print(f"[Enrichment] Generating suggestions for '{current_topic}'", file=sys.stderr)
         suggestions = await suggest_followup_topics(mock_ctx, current_topic, entity_names)
-
-        # Deduplicate suggestions (remove similar topic names)
-        seen_topics = set()
-        deduped_suggestions = []
-        for s in suggestions:
-            # Normalize topic name for comparison
-            normalized = s.topic.lower().replace("the ", "").replace("'s", "").strip()
-            # Also check partial matches (e.g., "Crystal Palace" vs "The other Crystal Palace")
-            is_duplicate = False
-            for seen in seen_topics:
-                if normalized in seen or seen in normalized:
-                    is_duplicate = True
-                    break
-            if not is_duplicate:
-                seen_topics.add(normalized)
-                deduped_suggestions.append(s)
-
-        context.suggestions = deduped_suggestions
-        print(f"[Enrichment] Generated {len(context.suggestions)} suggestions (deduped from {len(suggestions)})", file=sys.stderr)
+        context.suggestions = suggestions
+        print(f"[Enrichment] Generated {len(context.suggestions)} suggestions", file=sys.stderr)
 
         # Update context
         context.topics_discussed.append(current_topic)
@@ -1673,68 +1045,26 @@ async def generate_response_with_enrichment(
     from .database import search_articles_hybrid
     import sys
 
-    # ==========================================================================
-    # VALIDATION: Check content before processing
-    # ==========================================================================
-    validation_result = await validate_user_input(user_message, check_topic=False)
-
-    if not validation_result.is_valid:
-        print(f"[VIC Validation] Content blocked: {validation_result.category.value}", file=sys.stderr)
-        # Return VIC's warning response - don't process further
-        warning = validation_result.vic_warning or (
-            "I'm not sure that's something I can help with. "
-            "I specialise in London's hidden history. What aspect of the city would you like to explore?"
-        )
-        return (warning, None)
-
     # Check for prior enriched context
     prior_context = get_session_context(session_id)
 
     # If we have prior context with suggestions, use it to enhance the response
     context_enhancement = ""
     suggested_followups = ""
-    graph_connections_text = ""
-
-    # Always include topics already discussed (to prevent repetition)
-    if prior_context.topics_discussed:
-        topics_list = prior_context.topics_discussed[-5:]  # Last 5 topics
-        context_enhancement = f"\n\nTOPICS ALREADY DISCUSSED (don't repeat these facts): {', '.join(topics_list)}"
-        context_enhancement += "\nOffer NEW information or acknowledge you've covered this."
-        print(f"[VIC Agent] Topics already discussed: {topics_list}", file=sys.stderr)
 
     if prior_context.enrichment_complete:
         # Include prior entities
         if prior_context.entities:
             entity_names = [e.name for e in prior_context.entities[:5]]
-            context_enhancement += f"\nEntities mentioned: {', '.join(entity_names)}"
+            context_enhancement = f"\n\nPrior context - entities discussed: {', '.join(entity_names)}"
             print(f"[VIC Agent] Using prior context with {len(prior_context.entities)} entities", file=sys.stderr)
 
-        # Include suggested follow-up topics from Zep enrichment (excluding already discussed)
+        # Include suggested follow-up topics from Zep enrichment
         if prior_context.suggestions:
-            discussed_lower = {t.lower() for t in prior_context.topics_discussed}
-            fresh_suggestions = [
-                s.topic for s in prior_context.suggestions[:5]
-                if s.topic.lower() not in discussed_lower
-                and not any(d in s.topic.lower() or s.topic.lower() in d for d in discussed_lower)
-            ][:3]
-            if fresh_suggestions:
-                suggested_followups = f"\n\nSUGGESTED FOLLOW-UP TOPICS (NEW - not yet discussed): {', '.join(fresh_suggestions)}"
-                suggested_followups += "\nUse one of these for your follow-up question."
-                print(f"[VIC Agent] Fresh follow-up suggestions: {fresh_suggestions}", file=sys.stderr)
-
-        # Include graph connections from Zep
-        if prior_context.connections:
-            connections_list = [
-                f"- {c.from_entity} → {c.relation} → {c.to_entity}"
-                for c in prior_context.connections[:5]
-            ]
-            graph_connections_text = f"""
-
-## Connections from my wider network:
-{chr(10).join(connections_list)}
-
-If you mention these connections, preface with "From my wider network..." or "I can see a connection between..." """
-            print(f"[VIC Agent] Including {len(prior_context.connections)} graph connections", file=sys.stderr)
+            suggestion_topics = [s.topic for s in prior_context.suggestions[:3]]
+            suggested_followups = f"\n\nSUGGESTED FOLLOW-UP TOPICS (from knowledge graph): {', '.join(suggestion_topics)}"
+            suggested_followups += "\nUse one of these topics for your follow-up question if relevant."
+            print(f"[VIC Agent] Including {len(prior_context.suggestions)} follow-up suggestions", file=sys.stderr)
 
     # Extract user_id from session_id
     user_id = None
@@ -1765,34 +1095,13 @@ If you mention these connections, preface with "From my wider network..." or "I 
 
         if not results:
             import random
-            # Use graceful "no match" response with alternative suggestion
-            no_match = random.choice(NO_MATCH_RESPONSES)
+            # Offer a proactive suggestion when we don't have the requested topic
             fallback_cluster = random.choice(SAFE_TOPIC_CLUSTERS)
-            popular = get_topic_suggestion_from_popular()
-
-            # Offer popular topic if available, otherwise safe cluster
-            suggestion = popular if popular else fallback_cluster
             return (
-                f"{no_match} Perhaps {suggestion} would interest you?",
+                f"I don't seem to have any articles about that in my collection. "
+                f"But I could tell you about {fallback_cluster} instead, if you'd like?",
                 None
             )
-
-        # Store user query for history tracking (non-blocking)
-        if user_id and results:
-            from .database import store_user_query
-            top_result = results[0]
-            # Use actual article_id and slug from database (not chunk id)
-            article_id = top_result.get('article_id')
-            article_slug = top_result.get('article_slug')
-            asyncio.create_task(store_user_query(
-                user_id=user_id,
-                query=user_message,
-                article_id=int(article_id) if article_id else None,
-                article_title=top_result.get('title'),
-                article_slug=article_slug,
-                session_id=session_id
-            ))
-            print(f"[VIC Agent] Storing query for user {user_id}: {user_message[:50]}... (article: {article_slug})", file=sys.stderr)
 
         # Prepare source content - clean section references to avoid breaking immersion
         source_content = "\n\n---\n\n".join(
@@ -1828,32 +1137,15 @@ If you mention these connections, preface with "From my wider network..." or "I 
         if safe_followup_topics:
             safe_topics_hint = f"\n\nSAFE FOLLOW-UP TOPICS (we have articles on these): {', '.join(safe_followup_topics)}"
 
-        # Get emotion adjustment if user's emotion was detected
-        emotion_adjustment = get_emotion_adjustment(session_id)
-
-        # Get confidence level based on search scores
-        search_scores = [r.get('score', 0) for r in results]
-        confidence_level, confidence_instruction = get_confidence_level(search_scores)
-        print(f"[VIC Agent] Confidence level: {confidence_level} (best score: {max(search_scores) if search_scores else 0:.4f})", file=sys.stderr)
-
         # Build prompt for Pydantic AI agent
         agent_prompt = f"""Question: "{user_message}"
 {name_instruction}
-{emotion_adjustment}
-{confidence_instruction}
 {context_enhancement}
 {suggested_followups}
 {safe_topics_hint}
-{graph_connections_text}
 
 Source material (USE ONLY THESE FACTS):
 {source_content}
-
-STAY ON TOPIC:
-- Answer the question about "{user_message}" FIRST
-- You may briefly mention strong connections (one sentence max)
-- Don't let side topics take over - keep them brief
-- Offer to explore connections deeper in your follow-up question
 
 Respond naturally using ONLY facts from the source material above.
 Keep it conversational and under 150 words.
@@ -1893,15 +1185,14 @@ You MUST return a JSON with:
             response_text = validated_data.response_text
 
         except Exception as agent_error:
-            # Fallback to direct Google Gemini call if Pydantic AI agent fails
-            print(f"[VIC Agent] Agent failed ({type(agent_error).__name__}: {str(agent_error)[:100]}), falling back to Google Gemini", file=sys.stderr)
+            # Fallback to direct Groq call if Pydantic AI agent fails
+            print(f"[VIC Agent] Agent failed ({type(agent_error).__name__}: {str(agent_error)[:100]}), falling back to direct Groq", file=sys.stderr)
 
-            try:
-                # Wait a moment before fallback to avoid rate limits
-                await asyncio.sleep(0.3)
+            # Wait a moment before fallback to avoid rate limits
+            await asyncio.sleep(0.5)
 
-                client = get_google_client()
-                fallback_prompt = f"""Question: "{user_message}"
+            client = get_groq_client()
+            fallback_prompt = f"""Question: "{user_message}"
 {name_instruction}
 
 Source material:
@@ -1909,48 +1200,31 @@ Source material:
 
 Respond naturally using facts from above. Keep it conversational and under 150 words."""
 
-                llm_response = await client.post(
-                    "/models/gemini-2.0-flash:generateContent",
-                    json={
-                        "contents": [
-                            {"role": "user", "parts": [{"text": f"{VIC_SYSTEM_PROMPT}\n\n{fallback_prompt}"}]}
-                        ],
-                        "generationConfig": {
-                            "maxOutputTokens": 300,
-                            "temperature": 0.7,
-                        },
-                    },
-                )
-                llm_response.raise_for_status()
-                data = llm_response.json()
-                response_text = data["candidates"][0]["content"]["parts"][0]["text"]
+            llm_response = await client.post(
+                "/chat/completions",
+                json={
+                    "model": "llama-3.1-8b-instant",
+                    "max_tokens": 250,
+                    "messages": [
+                        {"role": "system", "content": VIC_SYSTEM_PROMPT},
+                        {"role": "user", "content": fallback_prompt},
+                    ],
+                },
+            )
+            llm_response.raise_for_status()
+            data = llm_response.json()
+            response_text = data["choices"][0]["message"]["content"]
 
-                # Clean up response
-                import re
-                response_text = re.sub(r'\n*TOPIC_CHECK:.*$', '', response_text, flags=re.DOTALL | re.IGNORECASE)
-                response_text = response_text.strip()
-            except Exception as fallback_error:
-                # Both failed - raise to outer handler
-                print(f"[VIC Agent] Fallback also failed: {type(fallback_error).__name__}: {str(fallback_error)[:100]}", file=sys.stderr)
-                raise fallback_error
+            # Clean up response
+            import re
+            response_text = re.sub(r'\n*TOPIC_CHECK:.*$', '', response_text, flags=re.DOTALL | re.IGNORECASE)
+            response_text = response_text.strip()
 
         # Additional post-validation for hallucination patterns
         validated_response = post_validate_response(response_text, source_content)
 
         # Clean any section/page references that slipped through
         validated_response = clean_section_references(validated_response)
-
-        # Track this topic for popularity metrics
-        track_topic(user_message, source_titles)
-
-        # Occasionally add validation encouragement (every ~4th response with pending interests)
-        if user_id and random.randint(1, 4) == 1:
-            pending_count = await get_pending_interest_count(user_id)
-            if pending_count > 0:
-                encouragement = get_validation_encouragement(pending_count)
-                if encouragement:
-                    validated_response += encouragement
-                    print(f"[VIC] Added validation encouragement ({pending_count} pending)", file=sys.stderr)
 
         # Start enrichment in background (non-blocking)
         enrichment_task = asyncio.create_task(
@@ -1964,35 +1238,10 @@ Respond naturally using facts from above. Keep it conversational and under 150 w
             )
         )
 
-        # Store conversation + create pending interest for human validation
-        if user_id and results:
-            article_matched = len(results) > 0
-            can_store, reason = await should_store_to_zep(user_message, article_matched, source_titles[0] if source_titles else None)
-
-            if can_store and source_titles:
-                top_result = results[0]
-
-                # 1. Store to Zep immediately (so VIC remembers) but mark as UNVALIDATED
-                # VIC can use this for conversation continuity
-                asyncio.create_task(store_unvalidated_interest(
-                    user_id=user_id,
-                    session_id=session_id,
-                    topic=user_message,
-                    article_title=top_result.get('title'),
-                ))
-
-                # 2. Create pending interest for dashboard confirmation
-                # When user confirms, it becomes validated
-                asyncio.create_task(create_pending_interest(
-                    user_id=user_id,
-                    topic=user_message,
-                    article_id=top_result.get('article_id'),
-                    article_title=top_result.get('title'),
-                    article_slug=top_result.get('article_slug'),
-                ))
-                print(f"[VIC] Stored unvalidated + created pending interest: {source_titles[0][:30]}...", file=sys.stderr)
-            else:
-                print(f"[VIC] Not storing interest: {reason}", file=sys.stderr)
+        # Store conversation in Zep (fire and forget)
+        if session_id:
+            asyncio.create_task(store_conversation_message(session_id, user_id, "user", user_message))
+            asyncio.create_task(store_conversation_message(session_id, user_id, "assistant", validated_response))
 
         return validated_response, enrichment_task
 
@@ -2030,7 +1279,7 @@ def get_proactive_suggestion(session_id: Optional[str]) -> Optional[str]:
     """
     Get a proactive suggestion to offer when user has been silent.
 
-    Uses enrichment context if available, then popular topics, falls back to safe topic clusters.
+    Uses enrichment context if available, falls back to safe topic clusters.
     Returns a gentle prompt like "Shall I suggest something?"
     """
     import random
@@ -2046,16 +1295,6 @@ def get_proactive_suggestion(session_id: Optional[str]) -> Optional[str]:
     if context.topics_discussed:
         last_topic = context.topics_discussed[-1]
         return f"Would you like me to suggest something related to {last_topic}?"
-
-    # Try popular topics - what other users have been asking about
-    popular_topic = get_topic_suggestion_from_popular()
-    if popular_topic:
-        prompts = [
-            f"Other visitors have been asking about {popular_topic}. Would you like to hear about that?",
-            f"A popular topic lately has been {popular_topic}. Shall I tell you about it?",
-            f"Many people have been curious about {popular_topic}. Would you like to explore that?",
-        ]
-        return random.choice(prompts)
 
     # Fallback to safe topic clusters
     cluster = random.choice(SAFE_TOPIC_CLUSTERS)

@@ -36,18 +36,6 @@ from .agent import (
     is_affirmation,
     get_last_suggestion,
     set_last_suggestion,
-    detect_topic_switch,
-    set_current_topic,
-    set_pending_topic_switch,
-    get_pending_topic_switch,
-    clear_pending_topic_switch,
-    clean_query,
-    check_returning_user,
-    update_interaction_time,
-    mark_greeted_this_session,
-    set_user_emotion,
-    get_emotion_adjustment,
-    extract_emotion_from_message,
 )
 from .database import Database
 from .tools import save_user_message
@@ -131,10 +119,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Include validated interests router for human-in-the-loop Zep storage
-from .validated_interests import router as validated_interests_router
-app.include_router(validated_interests_router)
-
 
 def verify_token(credentials: Optional[HTTPAuthorizationCredentials]) -> bool:
     """Verify the Bearer token from Hume."""
@@ -146,12 +130,11 @@ def verify_token(credentials: Optional[HTTPAuthorizationCredentials]) -> bool:
     return credentials.credentials == CLM_AUTH_TOKEN
 
 
-def extract_user_message_and_emotion(messages: list[dict]) -> tuple[Optional[str], str]:
-    """Extract the last user message and emotion from conversation history.
+def extract_user_message(messages: list[dict]) -> Optional[str]:
+    """Extract the last user message from conversation history.
 
-    Returns (message, emotion):
-    - message: None if silence/instruction, otherwise the cleaned message
-    - emotion: The emotion tags if present, otherwise empty string
+    Returns None if the most recent user message is silence or a system instruction,
+    to prevent responding to old messages.
     """
     for msg in reversed(messages):
         if msg.get("role") == "user":
@@ -169,21 +152,19 @@ def extract_user_message_and_emotion(messages: list[dict]) -> tuple[Optional[str
             # If the most recent user message is silence, return None
             # Don't fall back to earlier messages (that causes repetition)
             if content and content.lower().strip() == "[user silent]":
-                return (None, "")
+                return None
 
             # If the most recent user message is a greeting instruction, return None
             # The greeting handler will catch this case separately
             if content and content.lower().startswith("speak your greeting"):
-                return (None, "")
+                return None
 
-            # Extract Hume emotion tags like {very interested, quite contemplative}
-            emotion = ""
+            # Strip Hume emotion tags like {very interested, quite contemplative}
             if content and "{" in content:
-                cleaned, emotion = extract_emotion_from_message(content)
-                content = cleaned
+                content = re.sub(r'\s*\{[^}]+\}\s*$', '', content).strip()
 
-            return (content, emotion)
-    return (None, "")
+            return content
+    return None
 
 
 def extract_user_name_from_messages(messages: list[dict]) -> Optional[str]:
@@ -297,8 +278,6 @@ async def stream_response(text: str, session_id: Optional[str] = None):
 
     Hume EVI expects responses in the exact format of OpenAI's
     streaming chat completions API.
-
-    Includes natural pacing with micro-delays at punctuation.
     """
     chunk_id = str(uuid4())
     created = int(time.time())
@@ -309,12 +288,6 @@ async def stream_response(text: str, session_id: Optional[str] = None):
     for i, token_id in enumerate(tokens):
         token_text = enc.decode([token_id])
         yield create_chunk(chunk_id, created, token_text, session_id, is_first=(i == 0))
-
-        # Add micro-delays at punctuation for natural pacing
-        if token_text.rstrip() in {'.', '!', '?'}:
-            await asyncio.sleep(0.05)  # Longer pause at sentence end
-        elif token_text.rstrip() in {',', ';', ':', '...'}:
-            await asyncio.sleep(0.02)  # Shorter pause at clauses
 
     # Send final chunk with finish_reason
     final_chunk = ChatCompletionChunk(
@@ -465,14 +438,8 @@ async def chat_completions(
     messages = body.get("messages", [])
 
     session_id = extract_session_id(request, body)
-    user_message_extracted, user_emotion = extract_user_message_and_emotion(messages)
+    user_message_extracted = extract_user_message(messages)
     topic_extracted = extract_topic(user_message_extracted) if user_message_extracted else None
-
-    # Store user emotion for response adjustment
-    if user_emotion and session_id:
-        set_user_emotion(session_id, user_emotion)
-        import sys
-        print(f"[VIC CLM] Detected emotion: {user_emotion}", file=sys.stderr)
 
     # Store for debugging
     _last_request_debug = {
@@ -480,7 +447,6 @@ async def chat_completions(
         "session_id": session_id,
         "messages_count": len(messages),
         "user_message_extracted": user_message_extracted,
-        "user_emotion": user_emotion,
         "topic_extracted": topic_extracted,
         "messages": [
             {
@@ -535,141 +501,13 @@ async def chat_completions(
     )
 
     if is_greeting_request:
-        # Check if this is a returning user (after a time gap)
-        is_returning, last_topic = check_returning_user(session_id)
-
-        # Extract user_id to check Zep for their interests
-        user_id = None
-        if session_id and '|' in session_id:
-            user_id = session_id.split('|')[1].split('_')[0]
-
-        # Try to get user's ACTUAL recent topics from user_queries table (ground truth)
-        # This is more reliable than Zep's inferred facts
-        zep_topics = []
-        if user_id and not last_topic:
-            try:
-                from .database import get_connection
-                async with get_connection() as conn:
-                    # Get user's most recent queries with article titles
-                    recent = await conn.fetch("""
-                        SELECT DISTINCT article_title, created_at
-                        FROM user_queries
-                        WHERE user_id = $1 AND article_title IS NOT NULL
-                        ORDER BY created_at DESC
-                        LIMIT 5
-                    """, user_id)
-
-                    for row in recent:
-                        title = row['article_title']
-                        query = row.get('query', '').lower().strip()
-
-                        # Skip affirmations - they're follow-ups, not real topic queries
-                        if query in ['yes', 'no', 'ok', 'okay', 'sure', 'yeah', 'yep', 'nope']:
-                            continue
-
-                        if title:
-                            # Clean up title - extract main topic
-                            # "Vic Keegan's Lost London 103: Thorney Island" -> "Thorney Island"
-                            if ':' in title:
-                                topic = title.split(':')[-1].strip()
-                            else:
-                                topic = title
-                            if topic and len(topic) < 50 and topic not in zep_topics:
-                                zep_topics.append(topic)
-
-                    print(f"[VIC Greeting] Recent topics from DB: {zep_topics}", file=sys.stderr)
-            except Exception as e:
-                print(f"[VIC Greeting] Error fetching DB topics: {e}", file=sys.stderr)
-
-                # Fallback to Zep if DB fails
-                try:
-                    from .agent import get_zep_client, ZEP_API_KEY
-                    if ZEP_API_KEY:
-                        client = get_zep_client()
-                        if client:
-                            response = await client.post(
-                                "/api/v2/graph/search",
-                                json={
-                                    "user_id": user_id,
-                                    "query": "user interested in learning about topics",
-                                    "limit": 5,
-                                    "scope": "edges",
-                                },
-                            )
-                            if response.status_code == 200:
-                                edges = response.json().get("edges", [])
-                                # Sort by created_at (most recent first)
-                                edges.sort(key=lambda x: x.get("created_at", ""), reverse=True)
-                                for edge in edges:
-                                    fact = edge.get("fact", "")
-                                    if "interest" in fact.lower() and "learning about" in fact.lower():
-                                        import re
-                                        match = re.search(r"learning about ([^.]+)", fact, re.IGNORECASE)
-                                        if match:
-                                            topic = match.group(1).strip().rstrip('.')
-                                            if topic and len(topic) < 50:
-                                                zep_topics.append(topic)
-                                print(f"[VIC Greeting] Fallback Zep topics: {zep_topics}", file=sys.stderr)
-                except Exception as e2:
-                    print(f"[VIC Greeting] Zep fallback also failed: {e2}", file=sys.stderr)
-
-        # Varied greeting templates for returning users with topics
-        import random
-        RETURNING_WITH_TOPIC = [
-            "Ah, {name}, lovely to have you back. Last time you were curious about {topic}. Shall we pick up where we left off, or venture somewhere new?",
-            "Welcome back, {name}. I remember you were exploring {topic}. Would you like to continue that journey, or discover something different?",
-            "{name}, good to see you again. We were discussing {topic} before. Fancy hearing more about that, or shall we wander elsewhere?",
-            "Ah, {name}. I was hoping you'd return. You seemed quite taken with {topic}. More of that, or a fresh adventure?",
-        ]
-
-        # Varied greetings for returning users without specific topic
-        RETURNING_NO_TOPIC = [
-            "Ah, {name}, welcome back to Lost London. What hidden corner shall we explore today?",
-            "{name}, good to see you again. I've been collecting more stories since we last spoke. What takes your fancy?",
-            "Welcome back, {name}. The city has so many secrets yet to share. Where shall we begin?",
-        ]
-
-        # First-time user greetings
-        FIRST_TIME_GREETINGS = [
-            "Ah, hello {name}. I'm Vic, and I've spent years uncovering London's hidden stories. Over 370 of them, in fact. What corner of the city shall we explore together?",
-            "Welcome, {name}. I'm Vic Keegan, and I'd love to share some of London's forgotten tales with you. What piques your curiosity?",
-            "{name}, good to meet you. I'm Vic, collector of London's hidden history. From lost rivers to forgotten palaces, where shall we start?",
-        ]
-
-        # Anonymous user greetings
-        ANONYMOUS_GREETINGS = [
-            "Ah, hello there. I'm Vic, the voice of Vic Keegan. I've spent years uncovering London's hidden stories. What should I call you, and where shall we begin?",
-            "Welcome to Lost London. I'm Vic, and I've collected over 370 stories about this city's secret past. Might I ask your name before we start exploring?",
-        ]
-
-        # Determine the best topic to offer
-        topic_to_offer = last_topic
-        if not topic_to_offer and zep_topics:
-            topic_to_offer = zep_topics[0]
-
-        if user_name and topic_to_offer:
-            # Returning user with a topic to continue
-            template = random.choice(RETURNING_WITH_TOPIC)
-            greeting = template.format(name=user_name, topic=topic_to_offer)
-            mark_name_used(session_id, is_greeting=True)
-        elif user_name and (is_returning or zep_topics):
-            # Returning user but no specific topic
-            template = random.choice(RETURNING_NO_TOPIC)
-            greeting = template.format(name=user_name)
-            mark_name_used(session_id, is_greeting=True)
-        elif user_name:
-            # First-time user with name
-            template = random.choice(FIRST_TIME_GREETINGS)
-            greeting = template.format(name=user_name)
+        # Generate a proper greeting - warm and conversational, like Vic chatting over tea
+        # Avoid exclamation marks - they make the TTS sound too excited/different
+        if user_name:
+            greeting = f"Ah, hello {user_name}. Good to have you here. I'm Vic, and I've collected over 370 stories about London's hidden history. What corner of the city shall we explore together?"
             mark_name_used(session_id, is_greeting=True)
         else:
-            # Anonymous user
-            greeting = random.choice(ANONYMOUS_GREETINGS)
-
-        # Mark that we've greeted this session
-        mark_greeted_this_session(session_id)
-        update_interaction_time(session_id)
-
+            greeting = "Ah, hello there. I'm Vic, the voice of Vic Keegan. I've spent years uncovering London's hidden stories, and I'd love to share them with you. What should I call you, and where shall we begin?"
         return StreamingResponse(
             stream_response(greeting, session_id),
             media_type="text/event-stream",
@@ -683,54 +521,25 @@ async def chat_completions(
         from fastapi.responses import Response
         return Response(status_code=204)
 
-    # Check if there's a pending topic switch awaiting confirmation
-    pending_switch = get_pending_topic_switch(session_id)
+    # Check if this is an affirmation of a previous suggestion
+    # e.g., user says "yes" after VIC asked "Would you like to hear about X?"
     actual_query = user_message
-    import sys
+    is_affirm, topic_hint = is_affirmation(user_message)
 
-    if pending_switch:
-        is_affirm, _ = is_affirmation(user_message)
-        if is_affirm:
-            # User confirmed the topic switch
-            print(f"[VIC CLM] User confirmed topic switch to: '{pending_switch}'", file=sys.stderr)
-            actual_query = pending_switch
-            clear_pending_topic_switch(session_id)
-            set_current_topic(session_id, pending_switch)
+    if is_affirm:
+        import sys
+        if topic_hint:
+            # User said something like "yeah, the Thames" - use their topic hint
+            print(f"[VIC CLM] Affirmation with topic hint: '{topic_hint}'", file=sys.stderr)
+            actual_query = topic_hint
         else:
-            # User didn't confirm - they might be asking something else
-            clear_pending_topic_switch(session_id)
-            print(f"[VIC CLM] Topic switch not confirmed, processing: '{user_message}'", file=sys.stderr)
-    else:
-        # Check if this is an affirmation of a previous suggestion
-        is_affirm, topic_hint = is_affirmation(user_message)
-
-        if is_affirm:
-            if topic_hint:
-                # User said something like "yeah, the Thames" - use their topic hint
-                print(f"[VIC CLM] Affirmation with topic hint: '{topic_hint}'", file=sys.stderr)
-                actual_query = topic_hint
+            # Pure affirmation like "yes" - use last suggestion
+            last_suggestion = get_last_suggestion(session_id)
+            if last_suggestion:
+                print(f"[VIC CLM] Pure affirmation '{user_message}' -> using last suggestion: '{last_suggestion}'", file=sys.stderr)
+                actual_query = last_suggestion
             else:
-                # Pure affirmation like "yes" - use last suggestion
-                last_suggestion = get_last_suggestion(session_id)
-                if last_suggestion:
-                    print(f"[VIC CLM] Pure affirmation '{user_message}' -> using last suggestion: '{last_suggestion}'", file=sys.stderr)
-                    actual_query = last_suggestion
-                else:
-                    print(f"[VIC CLM] Affirmation detected but no last suggestion stored", file=sys.stderr)
-        else:
-            # Check for topic switch - if detected, clear old context and switch
-            is_switch, new_topic, _ = detect_topic_switch(user_message, session_id)
-            if is_switch:
-                print(f"[VIC CLM] Topic switch detected to: '{new_topic}'", file=sys.stderr)
-                # Clear old context for clean switch
-                set_current_topic(session_id, new_topic)
-                # Use the new topic as the query
-                actual_query = new_topic
-
-    # Clean the query - remove yes/no prefixes that are confirmations, not search terms
-    # "Yes, the Royal Aquarium" -> "the Royal Aquarium"
-    actual_query = clean_query(actual_query)
-    print(f"[VIC CLM] Cleaned query: '{actual_query}'", file=sys.stderr)
+                print(f"[VIC CLM] Affirmation detected but no last suggestion stored", file=sys.stderr)
 
     # Save user message to memory (fire and forget)
     if session_id:
@@ -745,9 +554,6 @@ async def chat_completions(
 
     # Always increment turn counter for tracking
     increment_turn_counter(session_id)
-
-    # Update interaction time for returning user detection
-    update_interaction_time(session_id)
 
     # OPTIMIZATION: Stream filler phrases while generating response
     # This disguises the delay and makes VIC feel more responsive
@@ -779,80 +585,6 @@ async def health():
 async def debug_last_request():
     """Return the last request received for debugging."""
     return _last_request_debug
-
-
-@app.get("/debug/session/{session_id}")
-async def debug_session(session_id: str):
-    """Return session context for debugging - shows what Zep/enrichment data is available."""
-    from .agent import get_session_context
-
-    context = get_session_context(session_id)
-
-    return {
-        "session_id": session_id,
-        "enrichment_complete": context.enrichment_complete,
-        "current_topic": context.current_topic,
-        "last_suggested_topic": context.last_suggested_topic,
-        "topics_discussed": context.topics_discussed,
-        "entities_count": len(context.entities),
-        "entities": [{"name": e.name, "type": e.entity_type.value if hasattr(e.entity_type, 'value') else str(e.entity_type)} for e in context.entities[:10]],
-        "connections_count": len(context.connections),
-        "connections": [
-            {"from": c.from_entity, "relation": c.relation, "to": c.to_entity}
-            for c in context.connections[:10]
-        ],
-        "suggestions_count": len(context.suggestions),
-        "suggestions": [{"topic": s.topic, "teaser": s.teaser} for s in context.suggestions[:5]],
-        "turns_since_name_used": context.turns_since_name_used,
-    }
-
-
-@app.get("/debug/popular-topics")
-async def debug_popular_topics():
-    """Return popular topics for analytics - shows what users are asking about."""
-    from .agent import get_popular_topics
-
-    topics = get_popular_topics(limit=20)
-
-    return {
-        "popular_topics": [
-            {"topic": t[0], "weighted_count": t[1], "articles": t[2] if len(t) > 2 else []}
-            for t in topics
-        ],
-        "total_tracked": len(topics),
-    }
-
-
-@app.get("/debug/cache-stats")
-async def debug_cache_stats():
-    """Return cache statistics for monitoring."""
-    from .tools import _embedding_cache, EMBEDDING_CACHE_TTL_SECONDS, MAX_EMBEDDING_CACHE_SIZE
-    import time
-
-    current_time = time.time()
-
-    # Calculate cache stats
-    total_entries = len(_embedding_cache)
-    valid_entries = 0
-    expired_entries = 0
-
-    for key, data in _embedding_cache.items():
-        age = current_time - data["timestamp"]
-        if age < EMBEDDING_CACHE_TTL_SECONDS:
-            valid_entries += 1
-        else:
-            expired_entries += 1
-
-    return {
-        "embedding_cache": {
-            "total_entries": total_entries,
-            "valid_entries": valid_entries,
-            "expired_entries": expired_entries,
-            "max_size": MAX_EMBEDDING_CACHE_SIZE,
-            "ttl_seconds": EMBEDDING_CACHE_TTL_SECONDS,
-            "recent_keys": list(_embedding_cache.keys())[:10],
-        }
-    }
 
 
 # Store last request for debugging
@@ -903,174 +635,6 @@ async def debug_search():
             "error": str(e),
             "traceback": traceback.format_exc(),
         }
-
-
-# =============================================================================
-# User History & Zep Integration Endpoints
-# =============================================================================
-
-@app.get("/api/user/{user_id}/conversations")
-async def get_user_conversations(user_id: str):
-    """
-    Get all conversation threads for a user from Zep.
-    Returns list of sessions with messages.
-    """
-    from .agent import get_zep_client, ZEP_API_KEY
-    import sys
-
-    if not ZEP_API_KEY:
-        return {"error": "Zep not configured", "conversations": []}
-
-    try:
-        client = get_zep_client()
-        if not client:
-            return {"error": "Zep client unavailable", "conversations": []}
-
-        # Get all threads for this user
-        response = await client.get(
-            f"/api/v2/users/{user_id}/threads",
-        )
-
-        if response.status_code != 200:
-            print(f"[Zep API] Failed to get threads: {response.status_code}", file=sys.stderr)
-            return {"error": f"Zep error: {response.status_code}", "conversations": []}
-
-        threads = response.json()
-        conversations = []
-
-        # Fetch messages for each thread (limit to recent 10 threads)
-        for thread in threads[:10]:
-            thread_id = thread.get("thread_id") or thread.get("id")
-            if not thread_id:
-                continue
-
-            msg_response = await client.get(
-                f"/api/v2/threads/{thread_id}/messages",
-                params={"limit": 50},
-            )
-
-            if msg_response.status_code == 200:
-                messages = msg_response.json()
-                conversations.append({
-                    "session_id": thread_id,
-                    "created_at": thread.get("created_at"),
-                    "messages": messages.get("messages", messages) if isinstance(messages, dict) else messages,
-                })
-
-        return {
-            "user_id": user_id,
-            "conversation_count": len(conversations),
-            "conversations": conversations,
-        }
-
-    except Exception as e:
-        print(f"[Zep API] Error: {e}", file=sys.stderr)
-        return {"error": str(e), "conversations": []}
-
-
-@app.get("/api/user/{user_id}/facts")
-async def get_user_facts(user_id: str):
-    """
-    Get knowledge graph facts about the user from Zep.
-    Returns user profile, preferences, and extracted facts.
-    """
-    from .agent import get_zep_client, ZEP_API_KEY
-    import sys
-
-    if not ZEP_API_KEY:
-        return {"error": "Zep not configured", "facts": []}
-
-    try:
-        client = get_zep_client()
-        if not client:
-            return {"error": "Zep client unavailable", "facts": []}
-
-        # Get user's knowledge graph edges (facts)
-        response = await client.post(
-            "/api/v2/graph/search",
-            json={
-                "user_id": user_id,
-                "query": "user preferences interests topics history",
-                "limit": 50,
-                "scope": "edges",
-            },
-        )
-
-        if response.status_code != 200:
-            print(f"[Zep API] Failed to get facts: {response.status_code}", file=sys.stderr)
-            return {"error": f"Zep error: {response.status_code}", "facts": []}
-
-        data = response.json()
-        edges = data.get("edges", [])
-
-        facts = []
-        for edge in edges:
-            fact = edge.get("fact")
-            if fact:
-                facts.append({
-                    "fact": fact,
-                    "created_at": edge.get("created_at"),
-                    "source": edge.get("source"),
-                    "target": edge.get("target"),
-                })
-
-        return {
-            "user_id": user_id,
-            "fact_count": len(facts),
-            "facts": facts,
-        }
-
-    except Exception as e:
-        print(f"[Zep API] Error: {e}", file=sys.stderr)
-        return {"error": str(e), "facts": []}
-
-
-@app.delete("/api/user/{user_id}/clear")
-async def clear_user_history(user_id: str):
-    """
-    Clear all conversation history and facts for a user.
-    Deletes from both Zep and local user_queries table.
-    """
-    from .agent import get_zep_client, ZEP_API_KEY
-    from .database import get_connection
-    import sys
-
-    results = {
-        "user_id": user_id,
-        "zep_cleared": False,
-        "local_cleared": False,
-        "errors": [],
-    }
-
-    # Clear from Zep
-    if ZEP_API_KEY:
-        try:
-            client = get_zep_client()
-            if client:
-                # Delete user from Zep (cascades to threads and facts)
-                response = await client.delete(f"/api/v2/users/{user_id}")
-                if response.status_code in [200, 204, 404]:
-                    results["zep_cleared"] = True
-                    print(f"[Zep API] Cleared user {user_id}", file=sys.stderr)
-                else:
-                    results["errors"].append(f"Zep delete failed: {response.status_code}")
-        except Exception as e:
-            results["errors"].append(f"Zep error: {str(e)}")
-
-    # Clear from local database
-    try:
-        async with get_connection() as conn:
-            deleted = await conn.execute(
-                "DELETE FROM user_queries WHERE user_id = $1",
-                user_id
-            )
-            results["local_cleared"] = True
-            print(f"[DB] Cleared queries for user {user_id}", file=sys.stderr)
-    except Exception as e:
-        results["errors"].append(f"DB error: {str(e)}")
-
-    results["success"] = results["zep_cleared"] or results["local_cleared"]
-    return results
 
 
 # For local development with uvicorn

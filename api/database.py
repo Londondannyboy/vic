@@ -120,18 +120,15 @@ async def search_articles_hybrid(
             )
             SELECT
                 kc.id::text,
-                kc.source_id as article_id,
                 kc.title,
                 kc.content,
                 kc.source_type,
-                a.slug as article_slug,
                 r.rrf_score as score,
                 r.vector_score,
                 r.vector_rank,
                 r.keyword_rank
             FROM rrf_combined r
             JOIN knowledge_chunks kc ON kc.id = r.id
-            LEFT JOIN articles a ON kc.source_id = a.id
             ORDER BY r.rrf_score DESC
             LIMIT $3
         """, embedding_json, query_text.lower(), limit)
@@ -175,56 +172,6 @@ async def get_cached_response(query: str) -> Optional[dict]:
             }
 
     return None
-
-
-async def get_duplicate_article_ids() -> set[int]:
-    """Get all article IDs that are duplicates (non-canonical versions)."""
-    try:
-        async with get_connection() as conn:
-            results = await conn.fetch("""
-                SELECT article_id_1 as dup_id FROM article_duplicates WHERE article_id_1 != canonical_id
-                UNION
-                SELECT article_id_2 as dup_id FROM article_duplicates WHERE article_id_2 != canonical_id
-            """)
-            return {r['dup_id'] for r in results}
-    except Exception:
-        return set()
-
-
-async def get_canonical_article_id(article_id: int) -> int:
-    """Get the canonical article ID for a potentially duplicate article."""
-    try:
-        async with get_connection() as conn:
-            result = await conn.fetchrow("""
-                SELECT canonical_id FROM article_duplicates
-                WHERE article_id_1 = $1 OR article_id_2 = $1
-            """, article_id)
-            return result['canonical_id'] if result else article_id
-    except Exception:
-        return article_id
-
-
-async def store_user_query(
-    user_id: str,
-    query: str,
-    article_id: Optional[int] = None,
-    article_title: Optional[str] = None,
-    article_slug: Optional[str] = None,
-    session_id: Optional[str] = None
-) -> None:
-    """Store a user's query in the user_queries table for history tracking."""
-    if not user_id or not query:
-        return
-
-    try:
-        async with get_connection() as conn:
-            await conn.execute("""
-                INSERT INTO user_queries (user_id, query, article_id, article_title, article_slug, session_id)
-                VALUES ($1, $2, $3, $4, $5, $6)
-            """, user_id, query, article_id, article_title, article_slug, session_id)
-    except Exception as e:
-        import sys
-        print(f"[VIC] Failed to store query: {e}", file=sys.stderr)
 
 
 async def cache_response(query: str, response: str, article_titles: list[str]) -> None:
