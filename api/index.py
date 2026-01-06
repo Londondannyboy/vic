@@ -524,12 +524,16 @@ async def chat_completions(
             try:
                 from .database import get_connection
                 async with get_connection() as conn:
+                    # Get most recent distinct topics (subquery to handle DISTINCT + ORDER BY)
                     recent = await conn.fetch("""
-                        SELECT DISTINCT article_title
-                        FROM user_queries
-                        WHERE user_id = $1 AND article_title IS NOT NULL
-                        ORDER BY created_at DESC
-                        LIMIT 3
+                        SELECT article_title FROM (
+                            SELECT article_title, MAX(created_at) as last_seen
+                            FROM user_queries
+                            WHERE user_id = $1 AND article_title IS NOT NULL
+                            GROUP BY article_title
+                            ORDER BY last_seen DESC
+                            LIMIT 3
+                        ) sub
                     """, user_id)
 
                     for row in recent:
